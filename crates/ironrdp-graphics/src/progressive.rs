@@ -17,7 +17,7 @@ use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
 
 use crate::dwt_extrapolate::BandInfo;
 use crate::rlgr::RlgrError;
-use crate::srl;
+use crate::srl::{SrlDecoder, SrlEncoder};
 
 /// Number of DWT coefficients per component in a 64x64 tile.
 pub const COEFFICIENTS_PER_COMPONENT: usize = 4096;
@@ -82,43 +82,49 @@ pub fn decode_first_pass(
     if is_difference {
         // Decode the deltas into scratch, then accumulate onto the retained
         // coefficients (saturating i16, DWT domain) per FreeRDP semantics.
+        // The DAS sign is captured from the *delta's* raw RLGR output (below),
+        // not the accumulated coefficients — matching FreeRDP.
         let mut delta = [0i16; COEFFICIENTS_PER_COMPONENT];
-        decode_first_components(data, base_quant, prog_quant, use_reduce_extrapolate, &mut delta)?;
+        decode_first_components(data, base_quant, prog_quant, use_reduce_extrapolate, &mut delta, sign)?;
         for (c, &d) in coefficients[..COEFFICIENTS_PER_COMPONENT].iter_mut().zip(delta.iter()) {
             *c = c.saturating_add(d);
         }
     } else {
-        decode_first_components(data, base_quant, prog_quant, use_reduce_extrapolate, coefficients)?;
+        decode_first_components(data, base_quant, prog_quant, use_reduce_extrapolate, coefficients, sign)?;
     }
-
-    // Capture sign state (DAS) from the resulting coefficients.
-    capture_sign(coefficients, sign);
 
     Ok(())
 }
 
-/// Decode one first-pass component into `out` (DWT-coefficient domain).
+/// Decode one first-pass component into `out` (DWT-coefficient domain) and
+/// capture the DAS `sign` from the raw RLGR output.
 ///
-/// RLGR1 decode -> LL3 differential decode -> base dequantization ->
-/// progressive dequantization. Shared by the difference and non-difference
-/// first-pass paths; does not capture sign.
+/// RLGR1 decode -> capture sign (FreeRDP: from the raw coefficients, before diff
+/// and dequant) -> LL3 differential decode -> base dequant -> progressive dequant.
 fn decode_first_components(
     data: &[u8],
     base_quant: &ComponentCodecQuant,
     prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
     out: &mut [i16],
+    sign: &mut [i8],
 ) -> Result<(), RlgrError> {
     // Step 1: RLGR1 decode into coefficient buffer
     crate::rlgr::decode(EntropyAlgorithm::Rlgr1, data, out)?;
 
-    // Step 2: LL3 differential decoding (reverse delta encoding on last subband)
+    // Step 2: Capture DAS sign from the raw RLGR coefficients (FreeRDP order:
+    // before differential decode / dequantization). For non-difference tiles the
+    // later shifts preserve sign, so this equals capturing afterwards; for
+    // difference tiles it captures the delta's sign, which is what upgrade needs.
+    capture_sign(out, sign);
+
+    // Step 3: LL3 differential decoding (reverse delta encoding on last subband)
     crate::subband_reconstruction::decode(&mut out[ll3_offset(use_reduce_extrapolate)..]);
 
-    // Step 3: Base dequantization (shift left by quant - 1)
+    // Step 4: Base dequantization (shift left by quant - 1)
     dequantize_component_ccq(out, base_quant, use_reduce_extrapolate);
 
-    // Step 4: Progressive dequantization (shift left by BitPos)
+    // Step 5: Progressive dequantization (shift left by BitPos)
     progressive_dequantize(out, prog_quant, use_reduce_extrapolate);
 
     Ok(())
@@ -126,25 +132,34 @@ fn decode_first_components(
 
 /// Decode an upgrade-pass component from SRL and raw data streams.
 ///
-/// For each coefficient position:
-/// - DAS = 0 (zero): decode from SRL stream, update DAS if non-zero
-/// - DAS != 0 (non-zero): decode raw magnitude bits, accumulate
+/// Faithful port of FreeRDP `progressive_rfx_upgrade_component`: a **single**
+/// SRL stream and a **single** raw stream are threaded across all 10 subbands in
+/// band order (HL1..HH3, then LL3), with the SRL decoder's `kp`/`nz`/`mode` and
+/// both bit positions carried across bands. Per band:
+/// - `num_bits = prevBitPos - currBitPos` (base quant cancels, so `prevProg - currProg`);
+///   bands with `num_bits == 0` consume nothing.
+/// - `shift = base_quant + curr_prog - 1` — the dequant left-shift for the refinement.
+/// - non-LL bands: `sign > 0` reads a raw magnitude (added), `sign < 0` reads raw
+///   (subtracted), `sign == 0` reads SRL and captures the new sign.
+/// - LL3: every position reads a raw magnitude (no SRL, sign ignored).
 ///
 /// # Arguments
-/// - `srl_data`: SRL-encoded stream for zero-DAS positions
-/// - `raw_data`: raw bit stream for non-zero-DAS positions
-/// - `prev_prog_quant`: BitPos values from previous quality level
-/// - `curr_prog_quant`: BitPos values for this quality level
-/// - `use_reduce_extrapolate`: whether to use asymmetric band sizes
-/// - `coefficients`: coefficient buffer to accumulate into (modified in-place)
+/// - `srl_data` / `raw_data`: the component's SRL and raw byte streams
+/// - `base_quant`: region base quantization for this component
+/// - `prev_prog_quant`: BitPos values from the previous pass (stored on the tile)
+/// - `curr_prog_quant`: BitPos values for this upgrade pass
+/// - `use_reduce_extrapolate`: selects the band layout
+/// - `coefficients`: accumulator (modified in-place)
 /// - `sign`: DAS sign buffer (modified in-place when zeros become non-zero)
 ///
 /// # Panics
 ///
 /// Panics if `coefficients` or `sign` has fewer than 4096 elements.
+#[expect(clippy::too_many_arguments, reason = "mirrors FreeRDP's per-component upgrade inputs")]
 pub fn decode_upgrade_pass(
     srl_data: &[u8],
     raw_data: &[u8],
+    base_quant: &ComponentCodecQuant,
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
@@ -155,64 +170,66 @@ pub fn decode_upgrade_pass(
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
     let bands = get_band_layout(use_reduce_extrapolate);
+    let mut srl = SrlDecoder::new(srl_data);
+    let mut raw = RawBitReader::new(raw_data);
 
     for (band_idx, band) in bands.iter().enumerate() {
-        let prev_bit_pos = prev_prog_quant.for_band(band_idx);
-        let curr_bit_pos = curr_prog_quant.for_band(band_idx);
-
-        // Number of raw bits per coefficient in this band
-        let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
+        let num_bits = prev_prog_quant
+            .for_band(band_idx)
+            .saturating_sub(curr_prog_quant.for_band(band_idx));
         if num_bits == 0 {
             continue;
         }
+        // shift = base + curr - 1 (FreeRDP progressive_rfx_quant_add + lsub 1).
+        let shift = i32::from(base_quant.for_band(band_idx)) + i32::from(curr_prog_quant.for_band(band_idx)) - 1;
+        let non_ll = band_idx != 9;
+        upgrade_block(&mut srl, &mut raw, band, num_bits, shift, non_ll, coefficients, sign);
+    }
+}
 
-        // Count zero-DAS positions in this band (for SRL decode)
-        let zero_count = band_zero_count(sign, band);
+/// Apply one subband's upgrade refinement (FreeRDP `progressive_rfx_upgrade_block`).
+#[expect(clippy::too_many_arguments, reason = "mirrors FreeRDP's per-band signature")]
+fn upgrade_block(
+    srl: &mut SrlDecoder<'_>,
+    raw: &mut RawBitReader<'_>,
+    band: &BandInfo,
+    num_bits: u8,
+    shift: i32,
+    non_ll: bool,
+    coefficients: &mut [i16],
+    sign: &mut [i8],
+) {
+    let read_raw = |raw: &mut RawBitReader<'_>| i32::try_from(raw.read_bits(u32::from(num_bits))).unwrap_or(0);
 
-        // SRL decode for zero-DAS positions
-        let srl_values = srl::decode_srl(srl_data, zero_count, num_bits);
+    for i in 0..band.count() {
+        let idx = band.offset + i;
 
-        // Apply upgrade values to this band
-        let mut srl_idx = 0;
-        let mut raw_reader = RawBitReader::new(raw_data);
-
-        for i in 0..band.count() {
-            let coeff_idx = band.offset + i;
-            let is_ll3 = band_idx == 9;
-
-            if sign[coeff_idx] == SIGN_ZERO {
-                // Zero-DAS: get value from SRL stream
-                let value = if srl_idx < srl_values.len() {
-                    srl_values[srl_idx]
-                } else {
-                    0
-                };
-                srl_idx += 1;
-
-                if value != 0 {
-                    // Coefficient transitions from zero to non-zero
-                    let shifted = i32::from(value) << i32::from(curr_bit_pos);
-                    coefficients[coeff_idx] = clamp_i16(shifted);
-                    sign[coeff_idx] = if value > 0 { SIGN_POSITIVE } else { SIGN_NEGATIVE };
-                }
-            } else {
-                // Non-zero DAS: read raw magnitude bits
-                let raw_mag = raw_reader.read_bits(u32::from(num_bits));
-
-                if raw_mag != 0 {
-                    // raw_mag fits in i32 (at most 2^15 from bit stream)
-                    let mag_i32 = i32::try_from(raw_mag).unwrap_or(i32::MAX);
-                    let shifted = mag_i32 << i32::from(curr_bit_pos);
-                    if is_ll3 || sign[coeff_idx] == SIGN_POSITIVE {
-                        // LL3 is always positive; positive DAS adds
-                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) + shifted);
-                    } else {
-                        // Negative DAS subtracts
-                        coefficients[coeff_idx] = clamp_i16(i32::from(coefficients[coeff_idx]) - shifted);
-                    }
+        let input: i32 = if !non_ll {
+            // LL3: raw magnitude for every coefficient.
+            read_raw(raw)
+        } else {
+            match sign[idx] {
+                SIGN_POSITIVE => read_raw(raw),
+                SIGN_NEGATIVE => -read_raw(raw),
+                _ => {
+                    let v = srl.read(num_bits);
+                    sign[idx] = match v.cmp(&0) {
+                        core::cmp::Ordering::Greater => SIGN_POSITIVE,
+                        core::cmp::Ordering::Less => SIGN_NEGATIVE,
+                        core::cmp::Ordering::Equal => SIGN_ZERO,
+                    };
+                    i32::from(v)
                 }
             }
-        }
+        };
+
+        // Accumulate input << shift. shift >= 0 for real quants (base >= 1).
+        let shifted = if shift >= 0 {
+            input.wrapping_shl(u32::try_from(shift).unwrap_or(0))
+        } else {
+            input >> u32::try_from(-shift).unwrap_or(0)
+        };
+        coefficients[idx] = clamp_i16(i32::from(coefficients[idx]) + shifted);
     }
 }
 
@@ -388,73 +405,56 @@ fn quantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuant,
 /// # Returns
 /// A tuple of `(srl_data, raw_data)` byte vectors.
 ///
-/// # Wire-format invariants (MS-RDPRFX 3.1.8.1.7.2)
-///
-/// The non-zero-DAS raw-magnitude path uses `saturating_sub` to compute
-/// `raw_mag = curr_q - prev_q`. Upgrade passes are *monotonic refinements*:
-/// the encoder only adds magnitude bits, never subtracts. The decoder's
-/// counterpart accumulates raw_mag onto the previously-decoded coefficient
-/// with the DAS-determined sign (`+=` for SIGN_POSITIVE / LL3, `-=` for
-/// SIGN_NEGATIVE), so a hypothetical signed delta would have no place in
-/// the wire format. Switching this to a signed-delta encoding would break
-/// wire compatibility with mstsc/FreeRDP — do not "fix" the saturating_sub.
-///
-/// The zero-DAS SRL path uses `clamp_i16(curr_shifted - prev_shifted)`. SRL
-/// stream values are i16 by wire-format definition, so wider precision is
-/// not available without a spec extension. The clamp is the wire-format
-/// boundary, not a precision compromise.
+/// Exact inverse of [`decode_upgrade_pass`]: a single [`SrlEncoder`] and a single
+/// [`RawBitWriter`] are threaded across all bands in band order, and the shift is
+/// `base_quant + curr_prog - 1`. The refinement is quantized by `>> shift`, so the
+/// round-trip is exact only when the true delta is an integer multiple of
+/// `1 << shift` (as the encoder pipeline arranges). Encode-side only (server/tests).
 pub fn encode_upgrade_pass(
     coefficients: &[i16],
     prev_coefficients: &[i16],
+    base_quant: &ComponentCodecQuant,
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
     sign: &[i8],
     use_reduce_extrapolate: bool,
 ) -> (Vec<u8>, Vec<u8>) {
     let bands = get_band_layout(use_reduce_extrapolate);
-    let mut all_srl_values = Vec::new();
+    let mut srl = SrlEncoder::new();
     let mut raw_writer = RawBitWriter::new();
 
     for (band_idx, band) in bands.iter().enumerate() {
-        let prev_bit_pos = prev_prog_quant.for_band(band_idx);
-        let curr_bit_pos = curr_prog_quant.for_band(band_idx);
-
-        let num_bits = prev_bit_pos.saturating_sub(curr_bit_pos);
+        let num_bits = prev_prog_quant
+            .for_band(band_idx)
+            .saturating_sub(curr_prog_quant.for_band(band_idx));
         if num_bits == 0 {
             continue;
         }
-
-        let mut band_srl_values = Vec::new();
+        let shift = i32::from(base_quant.for_band(band_idx)) + i32::from(curr_prog_quant.for_band(band_idx)) - 1;
+        let sh = u32::try_from(shift.max(0)).unwrap_or(0);
+        let max_mag = i32::from((1i16 << num_bits.min(14)) - 1);
+        let non_ll = band_idx != 9;
 
         for i in 0..band.count() {
-            let coeff_idx = band.offset + i;
+            let idx = band.offset + i;
+            let delta = i32::from(coefficients[idx]) - i32::from(prev_coefficients[idx]);
 
-            if sign[coeff_idx] == SIGN_ZERO {
-                // Zero-DAS: compute the refined value and encode via SRL
-                let curr_shifted = i32::from(coefficients[coeff_idx]) >> i32::from(curr_bit_pos);
-                let prev_shifted = i32::from(prev_coefficients[coeff_idx]) >> i32::from(curr_bit_pos);
-                let delta = clamp_i16(curr_shifted - prev_shifted);
-                band_srl_values.push(delta);
+            if non_ll && sign[idx] == SIGN_ZERO {
+                let v = i16::try_from((delta >> sh).clamp(-max_mag, max_mag)).unwrap_or(0);
+                srl.write(v, num_bits);
+            } else if non_ll && sign[idx] == SIGN_NEGATIVE {
+                // Decoder subtracts for negative DAS; encode positive magnitude of -delta.
+                let mag = u32::try_from(((-delta) >> sh).clamp(0, max_mag)).unwrap_or(0);
+                raw_writer.write_bits(mag, u32::from(num_bits));
             } else {
-                // Non-zero DAS: compute raw magnitude bits
-                let curr_abs = i32::from(coefficients[coeff_idx]).unsigned_abs();
-                let prev_abs = i32::from(prev_coefficients[coeff_idx]).unsigned_abs();
-
-                let curr_q = curr_abs >> u32::from(curr_bit_pos);
-                let prev_q = prev_abs >> u32::from(curr_bit_pos);
-                let raw_mag = curr_q.saturating_sub(prev_q);
-
-                raw_writer.write_bits(raw_mag, u32::from(num_bits));
+                // Positive DAS or LL3: decoder adds a positive magnitude.
+                let mag = u32::try_from((delta >> sh).clamp(0, max_mag)).unwrap_or(0);
+                raw_writer.write_bits(mag, u32::from(num_bits));
             }
         }
-
-        // Encode SRL values for this band
-        let srl_encoded = srl::encode_srl(&band_srl_values, num_bits);
-        all_srl_values.extend_from_slice(&srl_encoded);
     }
 
-    let raw_data = raw_writer.finish();
-    (all_srl_values, raw_data)
+    (srl.finish(), raw_writer.finish())
 }
 
 /// Encode RGBA pixels to spatial-domain i16 coefficients (RGB to YCbCr).
@@ -575,13 +575,6 @@ fn ll3_offset(use_reduce_extrapolate: bool) -> usize {
     } else {
         4032 // standard: 8x8 = 64 coefficients at offset 4032
     }
-}
-
-/// Count zero-DAS positions within a band.
-fn band_zero_count(sign: &[i8], band: &BandInfo) -> usize {
-    let start = band.offset;
-    let end = start + band.count();
-    sign[start..end].iter().filter(|&&s| s == SIGN_ZERO).count()
 }
 
 /// Clamp an i64 to u8 range (0-255).
@@ -824,6 +817,7 @@ impl TileState {
         &mut self,
         srl_data: [&[u8]; 3],
         raw_data: [&[u8]; 3],
+        base_quants: [&ComponentCodecQuant; 3],
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
     ) {
@@ -833,6 +827,7 @@ impl TileState {
             decode_upgrade_pass(
                 srl_data[c],
                 raw_data[c],
+                base_quants[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
                 self.use_reduce_extrapolate,
@@ -1133,17 +1128,19 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // The SYNC + CONTEXT blocks are optional per frame (MS-RDPEGFX 2.2.4.2);
-        // FreeRDP `progressive_wb_context` treats RFX_PROGRESSIVE_CONTEXT as a
-        // parameter update, never a decode gate. When present it refreshes the
-        // band-layout flag; otherwise we reuse the surface's stored flag, or
-        // default to non-extrapolate for a brand-new surface. `codecContextId`
-        // is deliberately ignored — the server increments it per frame while
-        // refining the same surface, so it is never a state boundary.
+        // The reduce-extrapolate DWT flag lives in the REGION block
+        // (`region->flags & RFX_DWT_REDUCE_EXTRAPOLATE`), per FreeRDP
+        // `progressive_decompress_tile_first`/`_upgrade`. The CONTEXT block's
+        // bit 0x01 is RFX_SUBBAND_DIFFING, a different field — reading extrapolate
+        // from it was wrong (it only coincidentally matches on Windows, which sets
+        // both). When no REGION is present we reuse the surface's stored flag, or
+        // default to non-extrapolate for a brand-new surface. `codecContextId` is
+        // deliberately ignored — the server increments it per frame while refining
+        // the same surface, so it is never a state boundary.
         let use_reduce_extrapolate = blocks
             .iter()
             .find_map(|block| match block {
-                ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
+                ProgressiveBlock::Region(r) => Some(r.uses_reduce_extrapolate()),
                 _ => None,
             })
             .or_else(|| {
@@ -1278,7 +1275,6 @@ fn decode_tile_block(
                 tile.is_difference(),
                 use_reduce_extrapolate,
             )?;
-
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
@@ -1315,7 +1311,6 @@ fn decode_tile_block(
                 tile.is_difference(),
                 use_reduce_extrapolate,
             )?;
-
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
@@ -1335,15 +1330,25 @@ fn decode_tile_block(
                 return Ok(Vec::new());
             }
 
+            let q_y = usize::from(tile.quant_idx_y);
+            let q_cb = usize::from(tile.quant_idx_cb);
+            let q_cr = usize::from(tile.quant_idx_cr);
+            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
+                return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                    index: q_y.max(q_cb).max(q_cr),
+                    table_len: quant_vals.len(),
+                });
+            }
+
             let [pq_y, pq_cb, pq_cr] = select_prog_quant(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
+                [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
                 [pq_y, pq_cb, pq_cr],
                 tile.quality,
             );
-
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
@@ -1528,74 +1533,91 @@ mod tests {
     }
 
     #[test]
-    fn band_zero_count_counts_correctly() {
-        let mut sign = [0i8; 4096];
-        // Band 0 (HL1): offset 0, count 1024
-        sign[0] = SIGN_POSITIVE;
-        sign[1] = SIGN_NEGATIVE;
-        sign[2] = SIGN_ZERO;
-        // Rest are SIGN_ZERO by default
-
-        let bands = standard_band_layout();
-        assert_eq!(band_zero_count(&sign, &bands[0]), 1022); // 1024 - 2 non-zero
-    }
-
-    #[test]
     fn ll3_offsets_correct() {
         assert_eq!(ll3_offset(false), 4032);
         assert_eq!(ll3_offset(true), 4015);
     }
 
+    /// End-to-end upgrade round-trip over one band (HL1) exercising all three
+    /// DAS routes: zero-DAS via SRL, positive-DAS and negative-DAS via raw.
+    /// The single SRL + single raw stream (FreeRDP model) must reproduce the
+    /// exact refined coefficients.
     #[test]
-    fn upgrade_pass_zero_das_becomes_nonzero() {
-        let mut coefficients = vec![0i16; 4096];
-        let mut sign = vec![SIGN_ZERO; 4096];
-
-        // Set up SRL data that produces a non-zero value for the first position
-        // For band 0 (HL1), with num_bits=2, SRL should produce some values
-        let prev_prog_quant = ComponentCodecQuant {
-            ll3: 0,
-            hl3: 0,
-            lh3: 0,
-            hh3: 0,
-            hl2: 0,
-            lh2: 0,
-            hh2: 0,
+    fn upgrade_round_trip_all_das_routes() {
+        let base = ComponentCodecQuant {
+            hl1: 6,
+            ..ComponentCodecQuant::LOSSLESS
+        };
+        // prevProg.HL1=4, currProg.HL1=2 => num_bits=2, shift=base+curr-1=7 (step 128).
+        let prev_prog = ComponentCodecQuant {
             hl1: 4,
-            lh1: 0,
-            hh1: 0,
+            ..ComponentCodecQuant::LOSSLESS
         };
-        let curr_prog_quant = ComponentCodecQuant {
-            ll3: 0,
-            hl3: 0,
-            lh3: 0,
-            hh3: 0,
-            hl2: 0,
-            lh2: 0,
-            hh2: 0,
+        let curr_prog = ComponentCodecQuant {
             hl1: 2,
-            lh1: 0,
-            hh1: 0,
+            ..ComponentCodecQuant::LOSSLESS
         };
 
-        // Simple SRL data: a non-zero value (the SRL decoder will interpret
-        // bits as magnitude + sign). With num_bits=2, k=0 initially,
-        // it goes straight to magnitude decode.
-        let srl_data = vec![0b01000000, 0x00]; // sign=0(+), magnitude bits follow
-        let raw_data = vec![];
+        let mut sign = vec![SIGN_ZERO; 4096];
+        sign[1] = SIGN_POSITIVE;
+        sign[2] = SIGN_NEGATIVE;
 
+        let mut prev_c = vec![0i16; 4096];
+        prev_c[1] = 1000;
+        prev_c[2] = -1000;
+
+        let step = 1i16 << 7;
+        let mut target = prev_c.clone();
+        target[0] = 2 * step; // zero-DAS -> SRL value +2
+        target[1] = 1000 + step; // positive-DAS -> raw mag 1
+        target[2] = -1000 - step; // negative-DAS -> raw mag 1
+
+        let (srl_data, raw_data) =
+            encode_upgrade_pass(&target, &prev_c, &base, &prev_prog, &curr_prog, &sign, false);
+
+        let mut coeffs = prev_c.clone();
+        let mut dsign = sign.clone();
         decode_upgrade_pass(
             &srl_data,
             &raw_data,
-            &prev_prog_quant,
-            &curr_prog_quant,
+            &base,
+            &prev_prog,
+            &curr_prog,
             false,
-            &mut coefficients,
-            &mut sign,
+            &mut coeffs,
+            &mut dsign,
         );
 
-        // After decode, at least some positions should have been updated
-        // (exact values depend on SRL interpretation, but the function shouldn't panic)
+        assert_eq!(coeffs[0], 2 * step, "zero-DAS SRL refinement");
+        assert_eq!(coeffs[1], 1000 + step, "positive-DAS raw refinement");
+        assert_eq!(coeffs[2], -1000 - step, "negative-DAS raw refinement");
+        assert_eq!(dsign[0], SIGN_POSITIVE, "zero-DAS became positive");
+        // Untouched positions stay put.
+        assert_eq!(coeffs[3], 0);
+        assert_eq!(coeffs[500], 0);
+    }
+
+    /// A no-refinement upgrade (prev == curr prog quant) produces empty streams
+    /// and leaves coefficients unchanged.
+    #[test]
+    fn upgrade_no_refinement_is_noop() {
+        let base = ComponentCodecQuant {
+            hl1: 6,
+            ..ComponentCodecQuant::LOSSLESS
+        };
+        let prog = ComponentCodecQuant::LOSSLESS;
+        let coeffs0 = vec![7i16; 4096];
+        let sign = vec![SIGN_POSITIVE; 4096];
+
+        let (srl_data, raw_data) =
+            encode_upgrade_pass(&coeffs0, &coeffs0, &base, &prog, &prog, &sign, false);
+        assert!(srl_data.is_empty());
+        assert!(raw_data.is_empty());
+
+        let mut coeffs = coeffs0.clone();
+        let mut dsign = sign;
+        decode_upgrade_pass(&srl_data, &raw_data, &base, &prog, &prog, false, &mut coeffs, &mut dsign);
+        assert_eq!(coeffs, coeffs0);
     }
 
     #[test]
@@ -1938,9 +1960,11 @@ mod tests {
         // Same prog_quant for prev and curr -> num_bits = 0, no refinement
         let prog_quant = ComponentCodecQuant::LOSSLESS;
 
+        let base_quant = ComponentCodecQuant::LOSSLESS;
         let (srl_data, raw_data) = encode_upgrade_pass(
             &coefficients,
             &prev_coefficients,
+            &base_quant,
             &prog_quant,
             &prog_quant,
             &sign,

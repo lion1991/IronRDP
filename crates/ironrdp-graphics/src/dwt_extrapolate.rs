@@ -409,16 +409,21 @@ fn dwt_col(
 // Helper
 // ---------------------------------------------------------------------------
 
-/// Truncate i32 to i16 (matches the `i32_to_i16_possible_truncation` pattern
-/// in the existing `dwt.rs`). DWT coefficients stay within i16 range for
-/// typical image data; truncation handles rare overflow gracefully.
+/// Saturating i32 -> i16 for inverse-DWT lifting steps (FreeRDP `clampi16`).
+///
+/// Every lifting result must saturate, not wrap: a coarse first pass carries
+/// large high-band coefficients (big dequant left-shift), and their `2*H` /
+/// average terms can exceed i16 mid-reconstruction. Wrapping (`as i16`) flips
+/// the sign and produces the classic high-frequency checkerboard / false-color
+/// tile; saturating keeps the reconstruction bounded, matching FreeRDP
+/// `progressive_rfx_idwt_x`/`_y`.
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    reason = "intentional truncation matching existing DWT convention"
+    reason = "value is clamped to i16 range before cast"
 )]
 fn t(value: i32) -> i16 {
-    value as i16
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 // ---------------------------------------------------------------------------

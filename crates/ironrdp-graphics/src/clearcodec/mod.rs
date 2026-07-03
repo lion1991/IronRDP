@@ -176,13 +176,15 @@ impl ClearCodecDecoder {
             for band in &bands {
                 let band_height = band.y_end - band.y_start + 1;
                 for (col_offset, vbar) in band.vbars.iter().enumerate() {
+                    // Cache bookkeeping must run for every V-bar before any
+                    // clipping: the server stores/advances cursors regardless
+                    // of where the column lands. Only the blit is clipped.
+                    let full_vbar = self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg);
+
                     let x = usize::from(band.x_start) + col_offset;
                     if x >= w {
                         continue;
                     }
-
-                    let full_vbar =
-                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
 
                     // Blit the full V-bar column into the output
                     let pixel_rows = full_vbar.pixels.len() / 3;
@@ -212,43 +214,50 @@ impl ClearCodecDecoder {
         Ok(())
     }
 
-    fn resolve_vbar(
-        &mut self,
-        vbar: &VBar<'_>,
-        band_height: u16,
-        bg_blue: u8,
-        bg_green: u8,
-        bg_red: u8,
-    ) -> DecodeResult<FullVBar> {
-        match vbar {
-            VBar::CacheHit { index } => {
-                let cached = self
-                    .vbar_cache
-                    .get_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("vbarIndex", "V-bar cache miss on hit"))?;
-                Ok(cached.clone())
+    /// Resolve a V-bar to full column pixels, keeping cache cursors in
+    /// server lockstep.
+    ///
+    /// The server advances its implicit cache cursors on every MISS and
+    /// stores a reconstructed full V-bar on every short HIT, unconditionally.
+    /// This method therefore never fails: lookup anomalies (stale/desynced
+    /// references, out-of-band geometry) degrade to a background-colored
+    /// column while every store the server performs is still mirrored here.
+    /// A wrong-colored column is repainted by later updates; a skipped store
+    /// desyncs every subsequent HIT for the rest of the session.
+    fn resolve_vbar(&mut self, vbar: &VBar<'_>, band_height: u16, bg_blue: u8, bg_green: u8, bg_red: u8) -> FullVBar {
+        let background = |height: u16| -> FullVBar {
+            let mut pixels = Vec::with_capacity(usize::from(height) * 3);
+            for _ in 0..height {
+                pixels.push(bg_blue);
+                pixels.push(bg_green);
+                pixels.push(bg_red);
             }
+            FullVBar { pixels }
+        };
+        match vbar {
+            VBar::CacheHit { index } => match self.vbar_cache.get_vbar(*index) {
+                // A plain hit performs no store on the server either.
+                Some(cached) => cached.clone(),
+                None => background(band_height),
+            },
             VBar::ShortCacheHit { index, y_on } => {
-                let cached_short = self
-                    .vbar_cache
-                    .get_short_vbar(*index)
-                    .ok_or_else(|| invalid_field_err!("shortVbarIndex", "short V-bar cache miss on hit"))?;
-                if usize::from(*y_on) + usize::from(cached_short.pixel_count) > usize::from(band_height) {
-                    return Err(invalid_field_err!(
-                        "shortVBarYOn",
-                        "y_on + pixel_count exceeds band height"
-                    ));
-                }
-                // Create a modified short vbar with the y_on from this reference
-                let modified = ShortVBar {
-                    y_on: *y_on,
-                    pixel_count: cached_short.pixel_count,
-                    pixels: cached_short.pixels.clone(),
+                let full = match self.vbar_cache.get_short_vbar(*index) {
+                    Some(cached_short) => {
+                        // Clamp to band height instead of failing so the
+                        // store below always happens.
+                        let max_count = band_height.saturating_sub(u16::from(*y_on)).min(255);
+                        let count = cached_short.pixel_count.min(u8::try_from(max_count).unwrap_or(u8::MAX));
+                        let short = ShortVBar {
+                            y_on: *y_on,
+                            pixel_count: count,
+                            pixels: cached_short.pixels[..usize::from(count) * 3].to_vec(),
+                        };
+                        VBarCache::reconstruct_full_vbar(&short, band_height, bg_blue, bg_green, bg_red)
+                    }
+                    None => background(band_height),
                 };
-                let full = VBarCache::reconstruct_full_vbar(&modified, band_height, bg_blue, bg_green, bg_red);
-                // Store reconstructed full V-bar in cache
                 self.vbar_cache.store_vbar(full.clone());
-                Ok(full)
+                full
             }
             VBar::ShortCacheMiss(miss) => {
                 let short = ShortVBar {
@@ -256,12 +265,10 @@ impl ClearCodecDecoder {
                     pixel_count: miss.y_off_delta,
                     pixels: miss.pixel_data.to_vec(),
                 };
-                // Store in short V-bar cache
                 self.vbar_cache.store_short_vbar(short.clone());
-                // Reconstruct and store full V-bar
                 let full = VBarCache::reconstruct_full_vbar(&short, band_height, bg_blue, bg_green, bg_red);
                 self.vbar_cache.store_vbar(full.clone());
-                Ok(full)
+                full
             }
         }
     }
@@ -823,5 +830,60 @@ mod tests {
         for seg in &segments {
             assert_eq!(seg.run_length, 1);
         }
+    }
+
+    #[test]
+    fn vbar_hit_miss_substitutes_background_without_store() {
+        // A plain V-bar HIT on an empty slot must not error, must return a
+        // background column, and must not advance any cursor (the server
+        // performs no store on plain hits either).
+        let mut dec = ClearCodecDecoder::new();
+        let full = dec.resolve_vbar(&VBar::CacheHit { index: 123 }, 4, 1, 2, 3);
+        assert_eq!(full.pixels, vec![1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]);
+        assert_eq!(dec.vbar_cache.vbar_cursor(), 0);
+        assert_eq!(dec.vbar_cache.short_vbar_cursor(), 0);
+    }
+
+    #[test]
+    fn short_vbar_hit_miss_substitutes_background_and_advances_full_cursor() {
+        // A short HIT on an empty slot must still store a (background)
+        // reconstruction into the full V-bar cache: the server advances its
+        // full cursor on every short hit, so skipping the store desyncs all
+        // subsequent full-V-bar HIT indices.
+        let mut dec = ClearCodecDecoder::new();
+        let full = dec.resolve_vbar(&VBar::ShortCacheHit { index: 7, y_on: 0 }, 2, 9, 8, 7);
+        assert_eq!(full.pixels, vec![9, 8, 7, 9, 8, 7]);
+        assert_eq!(dec.vbar_cache.vbar_cursor(), 1);
+        assert_eq!(dec.vbar_cache.short_vbar_cursor(), 0);
+        // The stored substitute must satisfy a subsequent plain HIT on slot 0.
+        let hit = dec.resolve_vbar(&VBar::CacheHit { index: 0 }, 2, 0, 0, 0);
+        assert_eq!(hit.pixels, vec![9, 8, 7, 9, 8, 7]);
+    }
+
+    #[test]
+    fn short_vbar_hit_clamps_overflow_and_still_stores() {
+        // y_on + pixel_count exceeding the band height must clamp (not
+        // error), and both stores must still land in cursor lockstep.
+        let mut dec = ClearCodecDecoder::new();
+        // Seed short slot 0 with a 3-pixel short V-bar (band height 4).
+        let miss = dec.resolve_vbar(
+            &VBar::ShortCacheMiss(ironrdp_pdu::codecs::clearcodec::ShortVBarCacheMiss {
+                y_on: 0,
+                y_off_delta: 3,
+                pixel_data: &[10, 11, 12, 20, 21, 22, 30, 31, 32],
+            }),
+            4,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(miss.pixels.len(), 12);
+        assert_eq!(dec.vbar_cache.short_vbar_cursor(), 1);
+        assert_eq!(dec.vbar_cache.vbar_cursor(), 1);
+        // Reference it with y_on=3 in a 4-row band: only 1 of 3 pixels fits.
+        let full = dec.resolve_vbar(&VBar::ShortCacheHit { index: 0, y_on: 3 }, 4, 1, 1, 1);
+        assert_eq!(full.pixels.len(), 12);
+        assert_eq!(&full.pixels[9..12], &[10, 11, 12]);
+        assert_eq!(dec.vbar_cache.vbar_cursor(), 2);
     }
 }

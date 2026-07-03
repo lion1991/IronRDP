@@ -32,6 +32,16 @@ fn prog_cap() -> u64 {
     })
 }
 
+fn clear_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("IRONRDP_EGFX_DUMP_CLEAR_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_CLEAR)
+    })
+}
+
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -75,7 +85,7 @@ pub(crate) fn dump(rec: &DumpRecord<'_>) {
         return;
     };
     let (counter, cap) = if rec.codec == "clearcodec" {
-        (&CLEAR_N, MAX_CLEAR)
+        (&CLEAR_N, clear_cap())
     } else {
         (&PROG_N, prog_cap())
     };

@@ -665,9 +665,12 @@ impl GraphicsPipelineClient {
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
         }
-        // ClearCodec maintains V-bar and glyph caches that must be rebuilt
-        // after a graphics reset (the server will re-send all needed state).
-        self.clearcodec_decoder = ClearCodecDecoder::new();
+        // ClearCodec decoder state (glyph + V-bar caches) deliberately survives
+        // ResetGraphics: per MS-RDPEGFX 2.2.2.14 a reset only destroys surfaces
+        // and the output mapping, it does not touch codec caches. The server
+        // keeps referencing cache entries populated before the reset; dropping
+        // the decoder here caused "V-bar cache miss on hit" cascades (black
+        // blocks) after mid-session resets.
 
         debug!(width, height, "Graphics reset");
         self.handler.on_reset_graphics(width, height);

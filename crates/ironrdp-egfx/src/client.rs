@@ -59,7 +59,7 @@ use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::zgfx;
-use ironrdp_pdu::geometry::ExclusiveRectangle;
+use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
 use tracing::{debug, trace, warn};
 
@@ -775,6 +775,13 @@ impl GraphicsPipelineClient {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
+        // MS-RDPEGFX 2.2.4.4: only pixels inside avc420MetaData.regionRects are valid in the
+        // decoded frame; everything else is encoder garbage (uninitialised YUV → renders green).
+        // Copy each regionRect (surface coords, inclusive) individually — NEVER the whole dest
+        // rect. Mirrors FreeRDP gdi/gfx.c, which does a per-rect YUV→RGB copy.
+        // Clone out the rects so `self.h264_decoder` can be borrowed mutably below.
+        let region_rects = stream.rectangles.clone();
+
         let Some(ref mut decoder) = self.h264_decoder else {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
             return Ok(());
@@ -783,38 +790,36 @@ impl GraphicsPipelineClient {
         let frame = decoder
             .decode(stream.data)
             .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
+        let (frame_w, frame_h) = (frame.width(), frame.height());
 
-        // MS-RDPEGFX 2.2.1.4.1: RDPGFX_RECT16 right/bottom are exclusive (one-past-end),
-        // so dimensions are right-left / bottom-top despite the parsed type's name.
-        let dest_width = dest_rect.right - dest_rect.left;
-        let dest_height = dest_rect.bottom - dest_rect.top;
-
-        // Decoded frame must be at least as large as the destination rectangle.
-        // Larger is expected (macroblock alignment) and handled by cropping.
-        // Smaller means the server sent mismatched dimensions.
-        if frame.width() < u32::from(dest_width) || frame.height() < u32::from(dest_height) {
-            warn!(
-                frame_width = frame.width(),
-                frame_height = frame.height(),
-                dest_width,
-                dest_height,
-                "decoded frame smaller than destination rectangle"
-            );
-            return Err(pdu_other_err!("decoded frame smaller than destination rectangle"));
+        if region_rects.is_empty() {
+            // Spec requires numRegionRects >= 1; a zero-region frame carries no valid pixels
+            // (nothing changed), so there is nothing to blit (FreeRDP loops 0 times too).
+            trace!(surface_id, ?dest_rect, "AVC420 frame with no region rects; nothing to blit");
+            return Ok(());
         }
 
-        let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
-
-        let update = BitmapUpdate {
-            surface_id,
-            destination_rectangle: dest_rect.clone(),
-            codec_id: Codec1Type::Avc420,
-            data: cropped_data,
-            width: dest_width,
-            height: dest_height,
-        };
-
-        self.handler.on_bitmap_updated(&update);
+        // One BitmapUpdate per regionRect, reusing the existing on_bitmap_updated semantics
+        // (dest rect + tight RGBA), so consumers accumulate a per-rect dirty region.
+        for rect in &region_rects {
+            let Some((data, x, y, w, h)) = extract_region_rgba(frame.data(), frame_w, frame_h, rect) else {
+                continue;
+            };
+            let update = BitmapUpdate {
+                surface_id,
+                destination_rectangle: ExclusiveRectangle {
+                    left: x,
+                    top: y,
+                    right: x.saturating_add(w),
+                    bottom: y.saturating_add(h),
+                },
+                codec_id: Codec1Type::Avc420,
+                data,
+                width: w,
+                height: h,
+            };
+            self.handler.on_bitmap_updated(&update);
+        }
         Ok(())
     }
 
@@ -1086,59 +1091,52 @@ fn convert_uncompressed_to_rgba(src: &[u8]) -> Vec<u8> {
     dst
 }
 
-/// Crop a decoded RGBA frame to target dimensions
+/// Extract one AVC420 regionRect from a decoded RGBA frame into a tight RGBA buffer.
 ///
-/// H.264 frames are macroblock-aligned (16x16), so decoded frames
-/// may be larger than the destination rectangle. This function
-/// extracts the top-left region matching the target size.
-fn crop_decoded_frame(
-    data: &[u8],
-    decoded_width: u32,
-    decoded_height: u32,
-    target_width: u16,
-    target_height: u16,
-) -> Vec<u8> {
-    let tw = u32::from(target_width);
-    let th = u32::from(target_height);
-
-    if decoded_width == 0 || decoded_height == 0 || tw == 0 || th == 0 {
-        return Vec::new();
+/// `rect` is in surface coordinates with **inclusive** right/bottom (MS-RDPEGFX
+/// RDPGFX_RECT16). The decoded H.264 frame is 16-pixel macroblock aligned, so it may be
+/// larger than the surface; the region is clipped to the frame bounds. Returns the tight
+/// RGBA data plus the region's exclusive-coord origin/size `(data, x, y, w, h)`, or `None`
+/// for an empty / malformed / out-of-frame rect.
+#[expect(clippy::as_conversions, reason = "u16/u32 widened to usize for indexing (lossless)")]
+fn extract_region_rgba(
+    frame: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+    rect: &InclusiveRectangle,
+) -> Option<(Vec<u8>, u16, u16, u16, u16)> {
+    if rect.right < rect.left || rect.bottom < rect.top {
+        return None;
     }
-
-    // If dimensions match, return as-is
-    if decoded_width == tw && decoded_height == th {
-        return data.to_vec();
+    // Frame dims are bounded by the surface size (<= u16::MAX); saturate defensively so all
+    // coordinate math stays in u16 (no truncating casts).
+    let fw = u16::try_from(frame_w).unwrap_or(u16::MAX);
+    let fh = u16::try_from(frame_h).unwrap_or(u16::MAX);
+    let (left, top) = (rect.left, rect.top);
+    // Inclusive → exclusive, then clip to the decoded frame.
+    let right = rect.right.saturating_add(1).min(fw);
+    let bottom = rect.bottom.saturating_add(1).min(fh);
+    if right <= left || bottom <= top {
+        return None;
     }
+    let w = right - left;
+    let h = bottom - top;
 
-    let src_stride = decoded_width.saturating_mul(4);
-    let dst_stride = tw.saturating_mul(4);
-    let rows = th.min(decoded_height);
-
-    #[expect(clippy::as_conversions, reason = "product of u32 values bounded by frame dimensions")]
-    let mut cropped = Vec::with_capacity((dst_stride as usize).saturating_mul(rows as usize));
-
-    for row in 0..rows {
-        #[expect(clippy::as_conversions, reason = "row * src_stride bounded by frame size")]
-        let src_start = (row.saturating_mul(src_stride)) as usize;
-        #[expect(clippy::as_conversions, reason = "bounded by frame dimensions")]
-        let copy_len = dst_stride.min(src_stride) as usize;
-        let src_end = src_start.saturating_add(copy_len);
-        if src_end <= data.len() {
-            cropped.extend_from_slice(&data[src_start..src_end]);
+    let src_stride = frame_w as usize * 4;
+    let left_off = usize::from(left) * 4;
+    let dst_stride = usize::from(w) * 4;
+    let mut out = Vec::with_capacity(dst_stride * usize::from(h));
+    for row in top..bottom {
+        let so = usize::from(row) * src_stride + left_off;
+        let se = so + dst_stride;
+        if se <= frame.len() {
+            out.extend_from_slice(&frame[so..se]);
+        } else {
+            // Defensive: never happens once clipped to frame bounds, but keep buffer sized.
+            out.resize(out.len() + dst_stride, 0);
         }
     }
-
-    #[expect(clippy::as_conversions, reason = "dst_stride * rows bounded by frame dimensions")]
-    let expected_len = (dst_stride as usize).saturating_mul(rows as usize);
-    if cropped.len() < expected_len {
-        tracing::warn!(
-            expected = expected_len,
-            actual = cropped.len(),
-            "Decoded frame data truncated during crop"
-        );
-    }
-
-    cropped
+    Some((out, left, top, w, h))
 }
 
 /// Unit tests that require access to private fields (state, surfaces, frame tracking).
@@ -1216,19 +1214,76 @@ mod tests {
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
     }
 
-    #[test]
-    fn crop_decoded_frame_identity() {
-        let data = vec![0xFFu8; 4 * 4 * 4];
-        let cropped = crop_decoded_frame(&data, 4, 4, 4, 4);
-        assert_eq!(cropped.len(), data.len());
+    /// Build a `w*h` RGBA frame where each pixel's R channel encodes `y*w + x`
+    /// (mod 256), so an extracted sub-region's provenance can be asserted.
+    fn ramp_frame(w: u32, h: u32) -> Vec<u8> {
+        let mut f = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let id = u8::try_from((y * w + x) % 256).unwrap_or(0);
+                f.extend_from_slice(&[id, 0, 0, 0xFF]);
+            }
+        }
+        f
+    }
+
+    fn incl(left: u16, top: u16, right: u16, bottom: u16) -> InclusiveRectangle {
+        InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        }
     }
 
     #[test]
-    fn crop_decoded_frame_macroblock_alignment() {
-        // H.264 encodes 1920x1080 as 1920x1088 (rounded to 16-pixel macroblock boundary)
-        let data = vec![0xAAu8; 1920 * 1088 * 4];
-        let cropped = crop_decoded_frame(&data, 1920, 1088, 1920, 1080);
-        assert_eq!(cropped.len(), 1920 * 1080 * 4);
+    fn extract_region_inclusive_to_exclusive() {
+        // 4x4 frame; region inclusive (1,1)-(2,2) → exclusive origin (1,1) size 2x2.
+        let frame = ramp_frame(4, 4);
+        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &incl(1, 1, 2, 2)).unwrap();
+        assert_eq!((x, y, w, h), (1, 1, 2, 2));
+        assert_eq!(data.len(), 2 * 2 * 4);
+        // Top-left of the region is frame pixel (1,1) → id = 1*4+1 = 5.
+        assert_eq!(data[0], 5);
+        // Next pixel in the region row is frame (2,1) → id = 6.
+        assert_eq!(data[4], 6);
+        // Second region row starts at frame (1,2) → id = 2*4+1 = 9.
+        assert_eq!(data[2 * 4], 9);
+    }
+
+    #[test]
+    fn extract_region_clips_to_frame_bounds() {
+        // Frame 1280x736 (16-aligned), surface 1280x732; a region touching the surface's
+        // bottom-right stays within the frame and is clipped to the frame if it overshoots.
+        let frame = ramp_frame(8, 8);
+        // Inclusive right/bottom of 20 would exceed the 8x8 frame → clipped to 8.
+        let (data, x, y, w, h) = extract_region_rgba(&frame, 8, 8, &incl(6, 6, 20, 20)).unwrap();
+        assert_eq!((x, y), (6, 6));
+        assert_eq!((w, h), (2, 2)); // right/bottom clamped to frame edge (exclusive 8).
+        assert_eq!(data.len(), 2 * 2 * 4);
+    }
+
+    #[test]
+    fn extract_region_full_frame() {
+        let frame = ramp_frame(4, 4);
+        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &incl(0, 0, 3, 3)).unwrap();
+        assert_eq!((x, y, w, h), (0, 0, 4, 4));
+        assert_eq!(data, frame);
+    }
+
+    #[test]
+    fn extract_region_rejects_malformed() {
+        let frame = ramp_frame(4, 4);
+        // right < left / bottom < top → None.
+        assert!(extract_region_rgba(&frame, 4, 4, &incl(3, 0, 1, 3)).is_none());
+        assert!(extract_region_rgba(&frame, 4, 4, &incl(0, 3, 3, 1)).is_none());
+    }
+
+    #[test]
+    fn extract_region_out_of_frame_is_none() {
+        let frame = ramp_frame(4, 4);
+        // left/top already at/beyond frame edge → clipped away → None.
+        assert!(extract_region_rgba(&frame, 4, 4, &incl(4, 4, 5, 5)).is_none());
     }
 
     #[test]

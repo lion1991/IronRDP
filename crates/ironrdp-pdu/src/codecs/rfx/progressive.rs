@@ -446,6 +446,14 @@ impl Decode<'_> for ProgressiveContextPdu {
 // Tile blocks
 // ---------------------------------------------------------------------------
 
+/// Bit 0 of a TILE_SIMPLE / TILE_FIRST `flags` byte ([MS-RDPRFX] 2.2.5.2.3.3).
+///
+/// When set, the tile carries DWT coefficient *deltas* relative to the tile
+/// previously decoded at the same grid slot; the decoder must add them to the
+/// retained coefficients before the inverse DWT rather than overwrite. Only
+/// TILE_SIMPLE and TILE_FIRST carry a `flags` byte; TILE_UPGRADE does not.
+pub const RFX_TILE_DIFFERENCE: u8 = 0x01;
+
 /// TILE_SIMPLE: non-progressive full-quality tile (single pass).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -466,6 +474,11 @@ impl TileSimple<'_> {
     const NAME: &'static str = "TileSimple";
     /// Fixed header: 3 quant idx + 2 x_idx + 2 y_idx + 1 flags + 4x2 lengths = 16 bytes.
     const HEADER_SIZE: usize = 3 + 2 + 2 + 1 + 8;
+
+    /// Whether the [`RFX_TILE_DIFFERENCE`] flag is set (coefficient-delta tile).
+    pub fn is_difference(&self) -> bool {
+        self.flags & RFX_TILE_DIFFERENCE != 0
+    }
 }
 
 impl Encode for TileSimple<'_> {
@@ -555,6 +568,11 @@ impl TileFirst<'_> {
     const NAME: &'static str = "TileFirst";
     /// Same as TileSimple + 1 byte for quality = 17 bytes.
     const HEADER_SIZE: usize = 3 + 2 + 2 + 1 + 1 + 8;
+
+    /// Whether the [`RFX_TILE_DIFFERENCE`] flag is set (coefficient-delta tile).
+    pub fn is_difference(&self) -> bool {
+        self.flags & RFX_TILE_DIFFERENCE != 0
+    }
 }
 
 impl Encode for TileFirst<'_> {

@@ -41,15 +41,24 @@ pub const SIGN_NEGATIVE: i8 = -1;
 
 /// Decode a first-pass component from RLGR1-encoded data.
 ///
-/// Performs: RLGR1 decode -> base dequantization -> progressive dequantization
-/// -> LL3 delta decode -> sign capture.
+/// Performs: RLGR1 decode -> LL3 delta decode -> base dequantization ->
+/// progressive dequantization, then either overwrites `coefficients` (normal
+/// tile) or accumulates the decoded deltas onto them (difference tile), and
+/// finally captures the DAS sign state.
+///
+/// When `is_difference` is set the [MS-RDPRFX] `RFX_TILE_DIFFERENCE` flag was
+/// present: the stream carries coefficient *deltas* relative to the tile last
+/// decoded at the same grid slot. Matching FreeRDP's `add_16s_inplace`, the
+/// deltas are added (saturating `i16`) to the retained coefficients in the
+/// DWT-coefficient domain, before the inverse DWT.
 ///
 /// # Arguments
 /// - `data`: RLGR1-encoded coefficient stream
 /// - `base_quant`: base quantization values (from region quant table, `ComponentCodecQuant` format)
 /// - `prog_quant`: progressive quantization BitPos values for this quality level
 /// - `use_reduce_extrapolate`: whether to use asymmetric band sizes
-/// - `coefficients`: output buffer for decoded coefficients (4096 i16)
+/// - `is_difference`: whether to accumulate onto retained coefficients instead of overwriting
+/// - `coefficients`: coefficient buffer (4096 i16); retained across frames for difference tiles
 /// - `sign`: output buffer for DAS sign state (4096 i8)
 ///
 /// # Panics
@@ -63,26 +72,54 @@ pub fn decode_first_pass(
     base_quant: &ComponentCodecQuant,
     prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
+    is_difference: bool,
     coefficients: &mut [i16],
     sign: &mut [i8],
 ) -> Result<(), RlgrError> {
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
+    if is_difference {
+        // Decode the deltas into scratch, then accumulate onto the retained
+        // coefficients (saturating i16, DWT domain) per FreeRDP semantics.
+        let mut delta = [0i16; COEFFICIENTS_PER_COMPONENT];
+        decode_first_components(data, base_quant, prog_quant, use_reduce_extrapolate, &mut delta)?;
+        for (c, &d) in coefficients[..COEFFICIENTS_PER_COMPONENT].iter_mut().zip(delta.iter()) {
+            *c = c.saturating_add(d);
+        }
+    } else {
+        decode_first_components(data, base_quant, prog_quant, use_reduce_extrapolate, coefficients)?;
+    }
+
+    // Capture sign state (DAS) from the resulting coefficients.
+    capture_sign(coefficients, sign);
+
+    Ok(())
+}
+
+/// Decode one first-pass component into `out` (DWT-coefficient domain).
+///
+/// RLGR1 decode -> LL3 differential decode -> base dequantization ->
+/// progressive dequantization. Shared by the difference and non-difference
+/// first-pass paths; does not capture sign.
+fn decode_first_components(
+    data: &[u8],
+    base_quant: &ComponentCodecQuant,
+    prog_quant: &ComponentCodecQuant,
+    use_reduce_extrapolate: bool,
+    out: &mut [i16],
+) -> Result<(), RlgrError> {
     // Step 1: RLGR1 decode into coefficient buffer
-    crate::rlgr::decode(EntropyAlgorithm::Rlgr1, data, coefficients)?;
+    crate::rlgr::decode(EntropyAlgorithm::Rlgr1, data, out)?;
 
     // Step 2: LL3 differential decoding (reverse delta encoding on last subband)
-    crate::subband_reconstruction::decode(&mut coefficients[ll3_offset(use_reduce_extrapolate)..]);
+    crate::subband_reconstruction::decode(&mut out[ll3_offset(use_reduce_extrapolate)..]);
 
     // Step 3: Base dequantization (shift left by quant - 1)
-    dequantize_component_ccq(coefficients, base_quant, use_reduce_extrapolate);
+    dequantize_component_ccq(out, base_quant, use_reduce_extrapolate);
 
     // Step 4: Progressive dequantization (shift left by BitPos)
-    progressive_dequantize(coefficients, prog_quant, use_reduce_extrapolate);
-
-    // Step 5: Capture sign state for DAS
-    capture_sign(coefficients, sign);
+    progressive_dequantize(out, prog_quant, use_reduce_extrapolate);
 
     Ok(())
 }
@@ -720,19 +757,28 @@ impl TileState {
 
     /// Decode a first-pass tile (TILE_SIMPLE or TILE_FIRST).
     ///
-    /// Resets this tile's state and decodes three components from RLGR1 data.
-    /// After this call, `coefficients` hold DWT-domain values ready for
-    /// inverse DWT + color conversion.
+    /// Decodes three components from RLGR1 data into DWT-domain coefficients
+    /// ready for inverse DWT + color conversion.
+    ///
+    /// When `is_difference` is set ([MS-RDPRFX] `RFX_TILE_DIFFERENCE`), the
+    /// decoded coefficients are *added* to this tile's retained coefficients
+    /// (delta against the last frame's decode at the same grid slot) rather
+    /// than overwriting them; otherwise the coefficients are replaced.
     ///
     /// # Arguments
     /// - `component_data`: RLGR1-encoded data for [Y, Cb, Cr]
     /// - `base_quants`: base quantization values for [Y, Cb, Cr]
     /// - `prog_quants`: progressive quantization for [Y, Cb, Cr]
     /// - `quality`: progressive quality byte
+    /// - `is_difference`: whether this is a coefficient-delta (difference) tile
     /// - `use_reduce_extrapolate`: DWT mode flag
     ///
     /// # Errors
     /// Returns `RlgrError` if any component's RLGR decode fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-component tile inputs plus the difference flag map directly to the wire fields"
+    )]
     pub fn decode_first(
         &mut self,
         component_data: [&[u8]; 3],
@@ -740,13 +786,14 @@ impl TileState {
         prog_quants: [ComponentCodecQuant; 3],
         quant_idx: [u8; 3],
         quality: u8,
+        is_difference: bool,
         use_reduce_extrapolate: bool,
     ) -> Result<(), RlgrError> {
         self.pass = 1;
         self.quality = quality;
         self.quant_idx = quant_idx;
         self.use_reduce_extrapolate = use_reduce_extrapolate;
-        self.is_difference = false;
+        self.is_difference = is_difference;
         self.prog_quant = prog_quants;
 
         for c in 0..3 {
@@ -755,6 +802,7 @@ impl TileState {
                 base_quants[c],
                 &prog_quants[c],
                 use_reduce_extrapolate,
+                is_difference,
                 &mut self.coefficients[c],
                 &mut self.sign[c],
             )?;
@@ -1200,6 +1248,7 @@ fn decode_tile_block(
                 [prog, prog, prog],
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 0xFF, // full quality
+                tile.is_difference(),
                 use_reduce_extrapolate,
             )?;
 
@@ -1243,6 +1292,7 @@ fn decode_tile_block(
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 tile.quality,
+                tile.is_difference(),
                 use_reduce_extrapolate,
             )?;
 
@@ -1858,5 +1908,175 @@ mod tests {
 
         assert!(srl_data.is_empty(), "no refinement bits, SRL should be empty");
         assert!(raw_data.is_empty(), "no refinement bits, raw should be empty");
+    }
+
+    // --- RFX_TILE_DIFFERENCE (difference-tile) decode tests ---
+
+    /// Lossless RLGR encode of one first-pass component (matches `decode_component`).
+    fn encode_component(mut coeffs: [i16; COEFFICIENTS_PER_COMPONENT]) -> Vec<u8> {
+        let q = ComponentCodecQuant::LOSSLESS;
+        let mut out = vec![0u8; 16384];
+        let n = encode_first_pass(&mut coeffs, &mut out, &q, &q, false).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    /// Lossless first-pass decode of one component into `coeffs` (DWT domain).
+    fn decode_component(data: &[u8], is_difference: bool, coeffs: &mut [i16; COEFFICIENTS_PER_COMPONENT]) {
+        let q = ComponentCodecQuant::LOSSLESS;
+        let mut sign = [0i8; COEFFICIENTS_PER_COMPONENT];
+        decode_first_pass(data, &q, &q, false, is_difference, coeffs, &mut sign).unwrap();
+    }
+
+    #[test]
+    fn decode_first_pass_difference_accumulates_onto_retained() {
+        let mut a = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut b = [0i16; COEFFICIENTS_PER_COMPONENT];
+        for i in 0..COEFFICIENTS_PER_COMPONENT {
+            a[i] = (i % 7) as i16 - 3;
+            b[i] = (i % 5) as i16 - 2;
+        }
+        let data_a = encode_component(a);
+        let data_b = encode_component(b);
+
+        // Independent non-difference decodes are the per-tile references.
+        let mut ref_a = [0i16; COEFFICIENTS_PER_COMPONENT];
+        decode_component(&data_a, false, &mut ref_a);
+        let mut ref_b = [0i16; COEFFICIENTS_PER_COMPONENT];
+        decode_component(&data_b, false, &mut ref_b);
+
+        // Difference path: decode A, then accumulate B onto the retained buffer.
+        let mut acc = [0i16; COEFFICIENTS_PER_COMPONENT];
+        decode_component(&data_a, false, &mut acc);
+        decode_component(&data_b, true, &mut acc);
+
+        for i in 0..COEFFICIENTS_PER_COMPONENT {
+            assert_eq!(acc[i], ref_a[i].saturating_add(ref_b[i]), "coeff {i}");
+        }
+        // The difference result must actually differ from a plain B decode.
+        assert!(
+            (0..COEFFICIENTS_PER_COMPONENT).any(|i| acc[i] != ref_b[i]),
+            "difference accumulation collapsed to plain overwrite"
+        );
+    }
+
+    #[test]
+    fn decode_first_pass_non_difference_overwrites_retained() {
+        let mut a = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut b = [0i16; COEFFICIENTS_PER_COMPONENT];
+        for i in 0..COEFFICIENTS_PER_COMPONENT {
+            a[i] = (i % 11) as i16 - 5;
+            b[i] = (i % 3) as i16 - 1;
+        }
+        let data_a = encode_component(a);
+        let data_b = encode_component(b);
+
+        let mut ref_b = [0i16; COEFFICIENTS_PER_COMPONENT];
+        decode_component(&data_b, false, &mut ref_b);
+
+        // Non-difference B after A must overwrite, not accumulate.
+        let mut buf = [0i16; COEFFICIENTS_PER_COMPONENT];
+        decode_component(&data_a, false, &mut buf);
+        decode_component(&data_b, false, &mut buf);
+        assert_eq!(buf, ref_b);
+    }
+
+    #[test]
+    fn tile_state_decode_first_records_difference_flag() {
+        let data = encode_component([0i16; COEFFICIENTS_PER_COMPONENT]);
+        let q = ComponentCodecQuant::LOSSLESS;
+        let mut tile = TileState::new();
+
+        tile.decode_first(
+            [&data, &data, &data],
+            [&q, &q, &q],
+            [q, q, q],
+            [0; 3],
+            0xFF,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!tile.is_difference);
+
+        tile.decode_first(
+            [&data, &data, &data],
+            [&q, &q, &q],
+            [q, q, q],
+            [0; 3],
+            0xFF,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(tile.is_difference);
+    }
+
+    /// End-to-end: a first non-difference frame, then a difference frame that
+    /// omits the CONTEXT block (as real servers do after the first frame).
+    /// Both must decode without error and yield the tile.
+    #[test]
+    fn progressive_decoder_difference_tile_across_frames() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, RFX_TILE_DIFFERENCE, TileSimple,
+            encode_progressive_stream,
+        };
+
+        fn build_stream(flags: u8, y: &[u8], cb: &[u8], cr: &[u8], with_context: bool) -> Vec<u8> {
+            let region = ProgressiveRegion {
+                tile_size: 0x40,
+                rects: vec![RfxRectangle {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 64,
+                }],
+                quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+                quant_prog_vals: vec![],
+                flags: 0,
+                tiles: vec![ProgressiveTile::Simple(TileSimple {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx: 0,
+                    y_idx: 0,
+                    flags,
+                    y_data: y,
+                    cb_data: cb,
+                    cr_data: cr,
+                    tail_data: &[],
+                })],
+            };
+            let mut blocks = vec![ProgressiveBlock::Sync(ProgressiveSyncPdu)];
+            if with_context {
+                blocks.push(ProgressiveBlock::Context(ProgressiveContextPdu {
+                    context_id: 0,
+                    tile_size: 0x0040,
+                    flags: 0,
+                }));
+            }
+            blocks.push(ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }));
+            blocks.push(ProgressiveBlock::Region(region));
+            blocks.push(ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu));
+            encode_progressive_stream(&blocks).unwrap()
+        }
+
+        let comp = encode_component([64i16; COEFFICIENTS_PER_COMPONENT]);
+        let mut decoder = ProgressiveDecoder::new();
+
+        // Frame 1: non-difference, with CONTEXT.
+        let f1 = build_stream(0, &comp, &comp, &comp, true);
+        let tiles1 = decoder.decode_bitmap(7, 64, 64, &f1).unwrap();
+        assert_eq!(tiles1.len(), 1);
+
+        // Frame 2: difference tile, CONTEXT omitted (fallback path must hold).
+        let f2 = build_stream(RFX_TILE_DIFFERENCE, &comp, &comp, &comp, false);
+        let tiles2 = decoder.decode_bitmap(7, 64, 64, &f2).unwrap();
+        assert_eq!(tiles2.len(), 1);
     }
 }

@@ -584,13 +584,13 @@ fn band_zero_count(sign: &[i8], band: &BandInfo) -> usize {
     sign[start..end].iter().filter(|&&s| s == SIGN_ZERO).count()
 }
 
-/// Clamp i32 to u8 range (0-255).
+/// Clamp an i64 to u8 range (0-255).
 #[expect(
     clippy::as_conversions,
     clippy::cast_sign_loss,
     reason = "value is clamped to 0..255 before cast"
 )]
-fn clamp_u8(value: i32) -> u8 {
+fn clamp_u8(value: i64) -> u8 {
     value.clamp(0, 255) as u8
 }
 
@@ -876,11 +876,14 @@ impl TileState {
             crate::dwt::decode(&mut cr_buf, &mut dwt_temp);
         }
 
-        // YCbCr to RGBA conversion
+        // YCbCr to RGBA conversion. Widen to i64: a partially-reconstructed
+        // tile (upgrade/difference passes whose earlier state was never seen)
+        // can leave near-full-scale i16 spatial values, and e.g. 32767*116130
+        // overflows i32. The result is clamped to 0..255 regardless.
         for i in 0..64 * 64 {
-            let y = i32::from(y_buf[i]) + 128;
-            let cb = i32::from(cb_buf[i]);
-            let cr = i32::from(cr_buf[i]);
+            let y = i64::from(y_buf[i]) + 128;
+            let cb = i64::from(cb_buf[i]);
+            let cr = i64::from(cr_buf[i]);
 
             // ITU-R BT.601 YCbCr to RGB conversion
             let r = y + ((cr * 91881 + 32768) >> 16);
@@ -1064,14 +1067,20 @@ impl From<RlgrError> for ProgressiveDecodeError {
     }
 }
 
-/// Per-context progressive state, identified by codec_context_id.
+/// Per-surface progressive state (tile coefficient grid).
 struct ProgressiveContext {
     surface: SurfaceTiles,
 }
 
 /// High-level progressive bitmap decoder for EGFX WireToSurface2 processing.
 ///
-/// Maintains per-context tile state across frames, keyed by `codec_context_id`.
+/// Maintains tile state per **surface** across frames, matching FreeRDP
+/// (`progressive_create_surface_context` keys on `surfaceId`). The wire
+/// `codecContextId` is *not* a decode-state boundary — it only drives
+/// DeleteEncodingContext lifecycle (MS-RDPEGFX 3.3.8.2) — so a server that
+/// increments `codecContextId` every frame keeps refining the same persistent
+/// per-surface tile grid.
+///
 /// Feed it progressive bitmap data from `WireToSurface2Pdu.bitmap_data` and
 /// get back decoded RGBA tiles for compositing.
 ///
@@ -1082,7 +1091,7 @@ struct ProgressiveContext {
 ///
 /// // On receiving WireToSurface2Pdu:
 /// let tiles = decoder.decode_bitmap(
-///     pdu.codec_context_id,
+///     pdu.surface_id,
 ///     surface_width, surface_height,
 ///     &pdu.bitmap_data,
 /// )?;
@@ -1092,14 +1101,14 @@ struct ProgressiveContext {
 /// }
 /// ```
 pub struct ProgressiveDecoder {
-    contexts: BTreeMap<u32, ProgressiveContext>,
+    surfaces: BTreeMap<u16, ProgressiveContext>,
 }
 
 impl ProgressiveDecoder {
-    /// Create a new progressive decoder with no context state.
+    /// Create a new progressive decoder with no surface state.
     pub fn new() -> Self {
         Self {
-            contexts: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
         }
     }
 
@@ -1109,13 +1118,13 @@ impl ProgressiveDecoder {
     /// returns RGBA pixel data for each tile that was updated.
     ///
     /// # Arguments
-    /// - `codec_context_id`: context ID from the WireToSurface2Pdu
+    /// - `surface_id`: target surface ID from the WireToSurface2Pdu (state key)
     /// - `surface_width`: surface width in pixels (for tile grid sizing)
     /// - `surface_height`: surface height in pixels
     /// - `bitmap_data`: raw progressive block stream from the PDU
     pub fn decode_bitmap(
         &mut self,
-        codec_context_id: u32,
+        surface_id: u16,
         surface_width: u16,
         surface_height: u16,
         bitmap_data: &[u8],
@@ -1124,33 +1133,28 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // Extract the band-layout flag from the CONTEXT block when present.
-        // Per MS-RDPEGFX 2.2.4.2 the SYNC + CONTEXT blocks establish a codec
-        // context once (keyed by `codec_context_id`) and are not required to be
-        // repeated on subsequent frames that reference the same context.
-        // Real-world servers (xrdp, GNOME Remote Desktop) omit the CONTEXT
-        // block on every frame after the first one that established the
-        // context. The strict requirement rejected each of those frames with
-        // `MissingBlock("CONTEXT")`, freezing the image on the coarse first
-        // pass.
-        //
-        // Fall back to the value stored when the context was first created.
-        // Only error when neither source is available, i.e. the very first
-        // frame for a context arrived without a CONTEXT block.
-        let use_reduce_extrapolate = match blocks.iter().find_map(|block| match block {
-            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
-            _ => None,
-        }) {
-            Some(v) => v,
-            None => self
-                .contexts
-                .get(&codec_context_id)
-                .map(|c| c.surface.use_reduce_extrapolate)
-                .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?,
-        };
+        // The SYNC + CONTEXT blocks are optional per frame (MS-RDPEGFX 2.2.4.2);
+        // FreeRDP `progressive_wb_context` treats RFX_PROGRESSIVE_CONTEXT as a
+        // parameter update, never a decode gate. When present it refreshes the
+        // band-layout flag; otherwise we reuse the surface's stored flag, or
+        // default to non-extrapolate for a brand-new surface. `codecContextId`
+        // is deliberately ignored — the server increments it per frame while
+        // refining the same surface, so it is never a state boundary.
+        let use_reduce_extrapolate = blocks
+            .iter()
+            .find_map(|block| match block {
+                ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
+                _ => None,
+            })
+            .or_else(|| {
+                self.surfaces
+                    .get(&surface_id)
+                    .map(|c| c.surface.use_reduce_extrapolate)
+            })
+            .unwrap_or(false);
 
-        // Get or create the context for this codec_context_id
-        let context = match self.contexts.entry(codec_context_id) {
+        // Get or create the persistent tile grid for this surface.
+        let context = match self.surfaces.entry(surface_id) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
@@ -1193,16 +1197,17 @@ impl ProgressiveDecoder {
         Ok(decoded_tiles)
     }
 
-    /// Delete a codec context, freeing its tile state.
+    /// Drop a surface's progressive tile state, freeing its coefficient grid.
     ///
-    /// Called when the server sends RDPGFX_DELETE_ENCODING_CONTEXT.
-    pub fn delete_context(&mut self, codec_context_id: u32) {
-        self.contexts.remove(&codec_context_id);
+    /// Called on RDPGFX_DELETE_ENCODING_CONTEXT (keyed by its `surfaceId`) or
+    /// when the surface itself is deleted.
+    pub fn delete_surface(&mut self, surface_id: u16) {
+        self.surfaces.remove(&surface_id);
     }
 
-    /// Reset all contexts (e.g., on EGFX channel reset).
+    /// Reset all surface state (e.g., on EGFX channel reset / ResetGraphics).
     pub fn reset(&mut self) {
-        self.contexts.clear();
+        self.surfaces.clear();
     }
 }
 
@@ -1650,14 +1655,14 @@ mod tests {
     #[test]
     fn decoder_new_is_empty() {
         let decoder = ProgressiveDecoder::new();
-        assert!(decoder.contexts.is_empty());
+        assert!(decoder.surfaces.is_empty());
     }
 
     #[test]
-    fn decoder_delete_nonexistent_context() {
+    fn decoder_delete_nonexistent_surface() {
         let mut decoder = ProgressiveDecoder::new();
-        // Should not panic on non-existent context
-        decoder.delete_context(42);
+        // Should not panic on non-existent surface
+        decoder.delete_surface(42);
     }
 
     #[test]
@@ -1703,10 +1708,10 @@ mod tests {
         let encoded = encode_progressive_stream(&blocks).unwrap();
         let result = decoder.decode_bitmap(1, 640, 480, &encoded);
         assert!(result.is_ok());
-        assert_eq!(decoder.contexts.len(), 1);
+        assert_eq!(decoder.surfaces.len(), 1);
 
         decoder.reset();
-        assert!(decoder.contexts.is_empty());
+        assert!(decoder.surfaces.is_empty());
     }
 
     #[test]
@@ -2114,5 +2119,129 @@ mod tests {
         let f2 = build_stream(RFX_TILE_DIFFERENCE, &comp, &comp, &comp, false);
         let tiles2 = decoder.decode_bitmap(7, 64, 64, &f2).unwrap();
         assert_eq!(tiles2.len(), 1);
+    }
+
+    /// A REGION with no SYNC/CONTEXT block on a brand-new surface must decode
+    /// (FreeRDP treats CONTEXT as optional), never `MissingBlock("CONTEXT")`.
+    #[test]
+    fn progressive_decoder_region_without_context_decodes() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveRegion,
+            ProgressiveTile, TileSimple, encode_progressive_stream,
+        };
+
+        let comp = encode_component([48i16; COEFFICIENTS_PER_COMPONENT]);
+        let region = ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+            quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![ProgressiveTile::Simple(TileSimple {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 0,
+                y_idx: 0,
+                flags: 0,
+                y_data: &comp,
+                cb_data: &comp,
+                cr_data: &comp,
+                tail_data: &[],
+            })],
+        };
+        // No SYNC, no CONTEXT: just FrameBegin/Region/FrameEnd.
+        let blocks = vec![
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu { frame_index: 0, region_count: 1 }),
+            ProgressiveBlock::Region(region),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ];
+        let stream = encode_progressive_stream(&blocks).unwrap();
+
+        let mut decoder = ProgressiveDecoder::new();
+        let tiles = decoder.decode_bitmap(3, 64, 64, &stream).unwrap();
+        assert_eq!(tiles.len(), 1, "REGION without CONTEXT must still decode");
+    }
+
+    /// Tile state persists per surface across frames that carry *different*
+    /// wire `codecContextId`s. An UPGRADE tile in frame 2 only produces output
+    /// if the first-pass state from frame 1 survived; keying on codecContextId
+    /// (the old bug) would have started a fresh surface and dropped the upgrade.
+    #[test]
+    fn progressive_decoder_state_persists_across_context_ids() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, TileUpgrade,
+            encode_progressive_stream,
+        };
+
+        let comp = encode_component([48i16; COEFFICIENTS_PER_COMPONENT]);
+        let mut decoder = ProgressiveDecoder::new();
+
+        // Frame 1: simple tile establishes first-pass state; CONTEXT ctx_id 1.
+        let region1 = ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+            quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![ProgressiveTile::Simple(TileSimple {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 0,
+                y_idx: 0,
+                flags: 0,
+                y_data: &comp,
+                cb_data: &comp,
+                cr_data: &comp,
+                tail_data: &[],
+            })],
+        };
+        let f1 = encode_progressive_stream(&[
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu { context_id: 1, tile_size: 0x40, flags: 0 }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu { frame_index: 0, region_count: 1 }),
+            ProgressiveBlock::Region(region1),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .unwrap();
+        assert_eq!(decoder.decode_bitmap(9, 64, 64, &f1).unwrap().len(), 1);
+
+        // Frame 2: UPGRADE tile under a *different* codecContextId (7). Empty
+        // srl/raw = no-op refinement, but it still reconstructs a tile because
+        // the surface's first-pass state persisted.
+        let region2 = ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+            quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![ProgressiveTile::Upgrade(TileUpgrade {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 0,
+                y_idx: 0,
+                quality: 0xFF,
+                y_srl_data: &[],
+                y_raw_data: &[],
+                cb_srl_data: &[],
+                cb_raw_data: &[],
+                cr_srl_data: &[],
+                cr_raw_data: &[],
+            })],
+        };
+        let f2 = encode_progressive_stream(&[
+            ProgressiveBlock::Context(ProgressiveContextPdu { context_id: 7, tile_size: 0x40, flags: 0 }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu { frame_index: 1, region_count: 1 }),
+            ProgressiveBlock::Region(region2),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .unwrap();
+        let tiles2 = decoder.decode_bitmap(9, 64, 64, &f2).unwrap();
+        assert_eq!(tiles2.len(), 1, "upgrade must apply to persisted per-surface state");
     }
 }

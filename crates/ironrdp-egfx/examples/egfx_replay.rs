@@ -30,7 +30,7 @@ struct Meta {
     codec: String,
     width: u16,
     height: u16,
-    context_id: u32,
+    surface_id: u16,
 }
 
 /// Parse `0007_progressive_s1_w2560_h1466_ctx0.bin` style names.
@@ -40,10 +40,13 @@ fn parse_name(name: &str) -> Option<Meta> {
     let codec = parts.get(1)?.to_string();
     let mut width = 0;
     let mut height = 0;
-    let mut context_id = 0;
+    let mut surface_id = 0;
     for p in &parts {
-        if let Some(v) = p.strip_prefix("ctx") {
-            context_id = v.parse().unwrap_or(0);
+        if let Some(v) = p.strip_prefix('s') {
+            // `s<N>` surface id (skip `ctx...` / stray tokens that also start with 's').
+            if let Ok(v) = v.parse() {
+                surface_id = v;
+            }
         } else if let Some(v) = p.strip_prefix('w') {
             if let Ok(v) = v.parse() {
                 width = v;
@@ -58,7 +61,7 @@ fn parse_name(name: &str) -> Option<Meta> {
         codec,
         width,
         height,
-        context_id,
+        surface_id,
     })
 }
 
@@ -105,7 +108,7 @@ fn main() {
                 .map(|px| format!("{} BGRA bytes", px.len()))
                 .map_err(|e| chain(&e)),
             "progressive" => prog
-                .decode_bitmap(meta.context_id, meta.width, meta.height, &data)
+                .decode_bitmap(meta.surface_id, meta.width, meta.height, &data)
                 .map(|tiles| format!("{} tiles", tiles.len()))
                 .map_err(|e| format!("{e}")),
             other => {

@@ -75,10 +75,17 @@ impl ClearCodecDecoder {
                 .glyph_cache
                 .get(glyph_index)
                 .ok_or_else(|| invalid_field_err!("glyphIndex", "glyph cache miss on hit"))?;
-            if entry.width != width || entry.height != height {
-                return Err(invalid_field_err!("glyphIndex", "cached glyph dimensions mismatch"));
+            // FreeRDP clear.c validates the requested area against the cached
+            // pixel count (`nWidth * nHeight > glyphEntry->count`), not exact
+            // width/height equality: a hit reinterprets the flat cached pixels
+            // at the requested dimensions as long as the area fits. Requiring
+            // identical dimensions wrongly rejected legitimate hits (e.g. a 4px
+            // glyph re-referenced with a different but equal-area shape).
+            let cached_count = usize::from(entry.width) * usize::from(entry.height);
+            if pixel_count > cached_count {
+                return Err(invalid_field_err!("glyphIndex", "glyph cache entry smaller than requested area"));
             }
-            return Ok(entry.pixels.clone());
+            return Ok(entry.pixels[..pixel_count * 4].to_vec());
         }
 
         // Cap allocation to prevent OOM from adversarial dimensions.
@@ -625,6 +632,43 @@ mod tests {
 
         let pixels2 = decoder.decode(&hit_stream, 1, 1).unwrap();
         assert_eq!(pixels1, pixels2);
+    }
+
+    #[test]
+    fn glyph_hit_allows_smaller_or_equal_area() {
+        // Regression: a GLYPH_HIT whose requested dimensions differ from the
+        // cached glyph but whose area fits must succeed (FreeRDP validates the
+        // pixel count, not exact width/height). Store a 2x2 glyph, then hit it
+        // as 4x1 (same 4-pixel area).
+        let mut decoder = ClearCodecDecoder::new();
+
+        let mut stream = Vec::new();
+        stream.push(FLAG_GLYPH_INDEX);
+        stream.push(0x00);
+        stream.extend_from_slice(&7u16.to_le_bytes()); // glyph_index = 7
+        let residual = [0xFF, 0xFF, 0xFF, 0x04]; // white, run=4 pixels
+        stream.extend_from_slice(&4u32.to_le_bytes()); // residual bytes
+        stream.extend_from_slice(&0u32.to_le_bytes()); // bands
+        stream.extend_from_slice(&0u32.to_le_bytes()); // subcodec
+        stream.extend_from_slice(&residual);
+        let stored = decoder.decode(&stream, 2, 2).unwrap();
+        assert_eq!(stored.len(), 4 * 4);
+
+        // Hit with a different shape but equal area: previously errored with
+        // "cached glyph dimensions mismatch".
+        let mut hit = Vec::new();
+        hit.push(FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT);
+        hit.push(0x01);
+        hit.extend_from_slice(&7u16.to_le_bytes());
+        let got = decoder.decode(&hit, 4, 1).unwrap();
+        assert_eq!(got, stored);
+
+        // A hit requesting more pixels than cached is still rejected.
+        let mut too_big = Vec::new();
+        too_big.push(FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT);
+        too_big.push(0x02);
+        too_big.extend_from_slice(&7u16.to_le_bytes());
+        assert!(decoder.decode(&too_big, 4, 4).is_err());
     }
 
     #[test]

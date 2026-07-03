@@ -1206,6 +1206,28 @@ impl ProgressiveDecoder {
     }
 }
 
+/// Select the per-component progressive quant for a tile `quality`.
+///
+/// Mirrors FreeRDP: `quality == 0xFF` selects the full/lossless progressive
+/// quant (all-zero BitPos, `quantProgValFull`); any other value indexes the
+/// region progressive quant table.
+fn select_prog_quant(
+    quality: u8,
+    prog_quant_vals: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant],
+) -> Result<[ComponentCodecQuant; 3], ProgressiveDecodeError> {
+    if quality == 0xFF {
+        return Ok([ComponentCodecQuant::LOSSLESS; 3]);
+    }
+    let idx = usize::from(quality);
+    let pq = prog_quant_vals
+        .get(idx)
+        .ok_or(ProgressiveDecodeError::InvalidQuantIndex {
+            index: idx,
+            table_len: prog_quant_vals.len(),
+        })?;
+    Ok([pq.y_quant, pq.cb_quant, pq.cr_quant])
+}
+
 #[expect(
     clippy::similar_names,
     reason = "q_y/q_cb/q_cr are standard component quant index names"
@@ -1277,19 +1299,12 @@ fn decode_tile_block(
                 });
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            let [pq_y, pq_cb, pq_cr] = select_prog_quant(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_first(
                 [tile.y_data, tile.cb_data, tile.cr_data],
                 [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                [pq_y, pq_cb, pq_cr],
                 [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
                 tile.quality,
                 tile.is_difference(),
@@ -1315,19 +1330,12 @@ fn decode_tile_block(
                 return Ok(Vec::new());
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            let [pq_y, pq_cb, pq_cr] = select_prog_quant(tile.quality, prog_quant_vals)?;
 
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                [pq_y, pq_cb, pq_cr],
                 tile.quality,
             );
 
@@ -1712,6 +1720,34 @@ mod tests {
 
         let e = ProgressiveDecodeError::InvalidQuantIndex { index: 3, table_len: 2 };
         assert!(e.to_string().contains("3"));
+    }
+
+    #[test]
+    fn prog_quant_quality_ff_selects_lossless_full() {
+        use ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant;
+
+        // Regression: TILE_FIRST/UPGRADE with quality == 0xFF must select the
+        // full/lossless progressive quant (FreeRDP quantProgValFull), NOT index
+        // the region table. Real servers send quality 0xFF with numProgQuant 0,
+        // which previously errored with `quant index 255 exceeds table length 0`.
+        let empty: &[ProgressiveCodecQuant] = &[];
+        let got = select_prog_quant(0xFF, empty).unwrap();
+        assert_eq!(got, [ComponentCodecQuant::LOSSLESS; 3]);
+
+        // A concrete (non-0xFF) quality still indexes the table.
+        let table = vec![ProgressiveCodecQuant {
+            quality: 0,
+            y_quant: ComponentCodecQuant::LOSSLESS,
+            cb_quant: ComponentCodecQuant::LOSSLESS,
+            cr_quant: ComponentCodecQuant::LOSSLESS,
+        }];
+        assert!(select_prog_quant(0, &table).is_ok());
+
+        // Out-of-range quality still errors.
+        assert!(matches!(
+            select_prog_quant(5, &table),
+            Err(ProgressiveDecodeError::InvalidQuantIndex { index: 5, table_len: 1 })
+        ));
     }
 
     #[test]

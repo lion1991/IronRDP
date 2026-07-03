@@ -6,5 +6,6 @@ pub const CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
 
 pub mod client;
 pub mod decode;
+mod dump;
 pub mod pdu;
 pub mod server;

@@ -65,6 +65,7 @@ use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::decode::H264Decoder;
+use crate::dump;
 use crate::pdu::{
     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
@@ -502,6 +503,25 @@ impl GraphicsPipelineClient {
             }
             GfxPdu::WireToSurface2(pdu) => {
                 trace!("WireToSurface2 (progressive codec)");
+                if dump::enabled() {
+                    // Progressive is decoded by the handler with the *surface* dims;
+                    // record the same slice + dims so replay reproduces its input.
+                    let (w, h) = self
+                        .surfaces
+                        .get(&pdu.surface_id)
+                        .map_or((0, 0), |s| (s.width, s.height));
+                    let caps = format!("{:?}", self.negotiated_caps);
+                    dump::dump(&dump::DumpRecord {
+                        codec: "progressive",
+                        surface_id: pdu.surface_id,
+                        width: w,
+                        height: h,
+                        context_id: Some(pdu.codec_context_id),
+                        caps: &caps,
+                        data: &pdu.bitmap_data,
+                        error: None,
+                    });
+                }
                 self.handler.on_wire_to_surface2(&pdu);
                 Ok(vec![])
             }
@@ -808,10 +828,22 @@ impl GraphicsPipelineClient {
         let dest_width = dest_rect.right - dest_rect.left;
         let dest_height = dest_rect.bottom - dest_rect.top;
 
-        let bgra = self
-            .clearcodec_decoder
-            .decode(bitmap_data, dest_width, dest_height)
-            .map_err(|e| pdu_other_err!("ClearCodec decode", source: e))?;
+        let decoded = self.clearcodec_decoder.decode(bitmap_data, dest_width, dest_height);
+        if dump::enabled() {
+            let caps = format!("{:?}", self.negotiated_caps);
+            let err = decoded.as_ref().err().map(|e| error_chain(e));
+            dump::dump(&dump::DumpRecord {
+                codec: "clearcodec",
+                surface_id,
+                width: dest_width,
+                height: dest_height,
+                context_id: None,
+                caps: &caps,
+                data: bitmap_data,
+                error: err.as_deref(),
+            });
+        }
+        let bgra = decoded.map_err(|e| pdu_other_err!("ClearCodec decode", source: e))?;
 
         // ClearCodec outputs BGRA; convert to RGBA for the uniform BitmapUpdate format
         let rgba = convert_bgra_to_rgba(&bgra);
@@ -928,8 +960,11 @@ impl DvcProcessor for GraphicsPipelineClient {
         self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
         if let Err(e) = self.decompressor.decompress(payload, &mut self.decompressed_buffer) {
             warn!(error = %e, payload_len = payload.len(), "EGFX zgfx decompress failed; dropping packet");
-            self.handler
-                .on_pipeline_error(&format!("zgfx decompress failed ({} bytes): {e}", payload.len()));
+            self.handler.on_pipeline_error(&format!(
+                "zgfx decompress failed ({} bytes): {}",
+                payload.len(),
+                error_chain(&e)
+            ));
             return Ok(Vec::new());
         }
 
@@ -945,7 +980,8 @@ impl DvcProcessor for GraphicsPipelineClient {
                         // cannot be safely decoded. Keep the PDUs decoded so far, drop the
                         // remainder, and keep the session alive.
                         warn!(error = %e, "EGFX PDU decode failed; dropping remainder of packet");
-                        self.handler.on_pipeline_error(&format!("PDU decode failed: {e}"));
+                        self.handler
+                            .on_pipeline_error(&format!("PDU decode failed: {}", error_chain(&e)));
                         break;
                     }
                 }
@@ -960,7 +996,7 @@ impl DvcProcessor for GraphicsPipelineClient {
                 Ok(pdu_responses) => responses.extend(pdu_responses),
                 Err(e) => {
                     warn!(pdu = %kind, error = %e, "EGFX PDU handling failed; skipping");
-                    self.handler.on_pipeline_error(&format!("{kind}: {e}"));
+                    self.handler.on_pipeline_error(&format!("{kind}: {}", error_chain(&e)));
                 }
             }
         }
@@ -970,6 +1006,20 @@ impl DvcProcessor for GraphicsPipelineClient {
 }
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
+
+/// Flatten an error and its full `source()` chain into one line so non-fatal
+/// EGFX diagnostics show the real inner cause (e.g. the ClearCodec / decode
+/// reason) instead of only the outer `pdu_other_err!` context.
+fn error_chain(e: &dyn core::error::Error) -> String {
+    use core::fmt::Write as _;
+    let mut out = format!("{e}");
+    let mut src = e.source();
+    while let Some(inner) = src {
+        let _ = write!(out, " -> {inner}");
+        src = inner.source();
+    }
+    out
+}
 
 /// Human-readable descriptor for a GfxPdu, used in non-fatal error diagnostics.
 ///

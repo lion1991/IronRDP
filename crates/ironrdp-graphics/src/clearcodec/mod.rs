@@ -359,7 +359,16 @@ impl ClearCodecDecoder {
                 }
             }
             SubcodecId::NsCodec => {
-                // Not yet implemented; encoder avoids generating NSCodec tiles.
+                // NSCodec-compressed region (BGRA out); silently skipping these
+                // used to leave black rectangles that surface-to-cache then
+                // propagated across the screen.
+                let bgra = crate::nscodec::decode_nscodec(sub.bitmap_data, sub.width, sub.height)?;
+                let w = usize::from(sub.width);
+                for (row, src_row) in bgra.chunks_exact(w * 4).enumerate() {
+                    let y = usize::from(sub.y_start) + row;
+                    let dst = (y * sw + usize::from(sub.x_start)) * 4;
+                    output[dst..dst + w * 4].copy_from_slice(src_row);
+                }
             }
         }
 

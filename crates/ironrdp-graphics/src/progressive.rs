@@ -871,19 +871,21 @@ impl TileState {
             crate::dwt::decode(&mut cr_buf, &mut dwt_temp);
         }
 
-        // YCbCr to RGBA conversion. Widen to i64: a partially-reconstructed
-        // tile (upgrade/difference passes whose earlier state was never seen)
-        // can leave near-full-scale i16 spatial values, and e.g. 32767*116130
-        // overflows i32. The result is clamped to 0..255 regardless.
+        // YCbCr to RGBA conversion (FreeRDP general_yCbCrToRGB_16s8u_P3AC4R).
+        // Post-IDWT spatial coefficients live in a domain scaled by 32 (<<5)
+        // relative to pixel values, so the final `>> (16 + 5)` divides by 32.
+        // The DC offset is 4096 = 128 * 32. ycbcr_constants[16] (=const * 2^16):
+        // Cr->R 91916, Cr->G 46819, Cb->G 22527, Cb->B 115992. Omitting the >>5
+        // amplifies every deviation from mid-gray 32x, clamping to a few levels
+        // (posterization); the classic RFX path avoids this via the yuv crate.
         for i in 0..64 * 64 {
-            let y = i64::from(y_buf[i]) + 128;
+            let y = (i64::from(y_buf[i]) + 4096) << 16;
             let cb = i64::from(cb_buf[i]);
             let cr = i64::from(cr_buf[i]);
 
-            // ITU-R BT.601 YCbCr to RGB conversion
-            let r = y + ((cr * 91881 + 32768) >> 16);
-            let g = y - ((cb * 22554 + cr * 46802 + 32768) >> 16);
-            let b = y + ((cb * 116130 + 32768) >> 16);
+            let r = (y + cr * 91916) >> 21;
+            let g = (y - cb * 22527 - cr * 46819) >> 21;
+            let b = (y + cb * 115992) >> 21;
 
             let off = i * 4;
             pixels[off] = clamp_u8(r);
@@ -891,6 +893,24 @@ impl TileState {
             pixels[off + 2] = clamp_u8(b);
             pixels[off + 3] = 0xFF;
         }
+    }
+
+    /// Debug: post-IDWT spatial Y/Cb/Cr buffers (diagnostic tracing only).
+    pub fn debug_spatial(&self) -> [[i16; COEFFICIENTS_PER_COMPONENT]; 3] {
+        let mut y = self.coefficients[0];
+        let mut cb = self.coefficients[1];
+        let mut cr = self.coefficients[2];
+        let mut temp = [0i16; COEFFICIENTS_PER_COMPONENT];
+        if self.use_reduce_extrapolate {
+            crate::dwt_extrapolate::decode(&mut y, &mut temp);
+            crate::dwt_extrapolate::decode(&mut cb, &mut temp);
+            crate::dwt_extrapolate::decode(&mut cr, &mut temp);
+        } else {
+            crate::dwt::decode(&mut y, &mut temp);
+            crate::dwt::decode(&mut cb, &mut temp);
+            crate::dwt::decode(&mut cr, &mut temp);
+        }
+        [y, cb, cr]
     }
 }
 
@@ -1205,6 +1225,11 @@ impl ProgressiveDecoder {
     /// Reset all surface state (e.g., on EGFX channel reset / ResetGraphics).
     pub fn reset(&mut self) {
         self.surfaces.clear();
+    }
+
+    /// Debug: borrow a tile's state for diagnostic tracing.
+    pub fn surface_tile(&self, surface_id: u16, x_idx: u16, y_idx: u16) -> Option<&TileState> {
+        self.surfaces.get(&surface_id)?.surface.get(x_idx, y_idx)
     }
 }
 

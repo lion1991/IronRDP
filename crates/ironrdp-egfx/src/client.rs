@@ -354,6 +354,15 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// This is a catch-all for any GfxPdu variant not matched above.
     fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+
+    /// Called when a server→client PDU could not be processed (decode or handler error)
+    ///
+    /// EGFX is a graphics *enhancement* layer: a single malformed PDU or a codec
+    /// decode failure must never tear down the whole RDP session. The pipeline logs
+    /// the failure via this hook and skips the offending PDU. `detail` carries a
+    /// human-readable summary (PDU kind / codec id / surface id / error chain) so
+    /// consumers can surface a diagnostic without the pipeline aborting.
+    fn on_pipeline_error(&mut self, _detail: &str) {}
 }
 
 // ============================================================================
@@ -908,28 +917,52 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        // ZGFX decompress
+        // EGFX is a graphics enhancement layer: any decompress / decode / decode-codec
+        // failure is logged and skipped, never propagated. Returning Err here would
+        // bubble up through the DVC/x224 stack and tear down the entire RDP session
+        // (observed as "process frame failed: payload error"), which is unacceptable
+        // for an optional enhancement channel.
+
+        // ZGFX decompress — whole-packet; on failure drop the packet but keep the session.
         self.decompressed_buffer.clear();
         self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
-        self.decompressor
-            .decompress(payload, &mut self.decompressed_buffer)
-            .map_err(|e| decode_err!(e))?;
+        if let Err(e) = self.decompressor.decompress(payload, &mut self.decompressed_buffer) {
+            warn!(error = %e, payload_len = payload.len(), "EGFX zgfx decompress failed; dropping packet");
+            self.handler
+                .on_pipeline_error(&format!("zgfx decompress failed ({} bytes): {e}", payload.len()));
+            return Ok(Vec::new());
+        }
 
-        // Decode all PDUs first (cursor borrows decompressed_buffer)
+        // Decode all PDUs first (cursor borrows decompressed_buffer).
         let mut pdus = Vec::new();
         {
             let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
             while !cursor.is_empty() {
-                let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
-                pdus.push(pdu);
+                match decode_cursor::<GfxPdu>(&mut cursor) {
+                    Ok(pdu) => pdus.push(pdu),
+                    Err(e) => {
+                        // A parse failure desyncs the cursor, so the rest of this packet
+                        // cannot be safely decoded. Keep the PDUs decoded so far, drop the
+                        // remainder, and keep the session alive.
+                        warn!(error = %e, "EGFX PDU decode failed; dropping remainder of packet");
+                        self.handler.on_pipeline_error(&format!("PDU decode failed: {e}"));
+                        break;
+                    }
+                }
             }
         }
 
-        // Process decoded PDUs
+        // Process decoded PDUs — a single failing PDU is skipped, not fatal.
         let mut responses: Vec<DvcMessage> = Vec::new();
         for pdu in pdus {
-            let pdu_responses = self.handle_pdu(pdu)?;
-            responses.extend(pdu_responses);
+            let kind = gfx_pdu_kind_detail(&pdu);
+            match self.handle_pdu(pdu) {
+                Ok(pdu_responses) => responses.extend(pdu_responses),
+                Err(e) => {
+                    warn!(pdu = %kind, error = %e, "EGFX PDU handling failed; skipping");
+                    self.handler.on_pipeline_error(&format!("{kind}: {e}"));
+                }
+            }
         }
 
         Ok(responses)
@@ -937,6 +970,38 @@ impl DvcProcessor for GraphicsPipelineClient {
 }
 
 impl DvcClientProcessor for GraphicsPipelineClient {}
+
+/// Human-readable descriptor for a GfxPdu, used in non-fatal error diagnostics.
+///
+/// WireToSurface1 (the usual codec-decode culprit) is enriched with codec id,
+/// surface id and payload length so a real-machine failure log pinpoints the cause.
+fn gfx_pdu_kind_detail(pdu: &GfxPdu) -> String {
+    match pdu {
+        GfxPdu::WireToSurface1(w) => format!(
+            "WireToSurface1(codec={:?}, surface={}, bytes={})",
+            w.codec_id,
+            w.surface_id,
+            w.bitmap_data.len()
+        ),
+        GfxPdu::WireToSurface2(w) => format!("WireToSurface2(surface={})", w.surface_id),
+        GfxPdu::CreateSurface(_) => "CreateSurface".to_owned(),
+        GfxPdu::DeleteSurface(_) => "DeleteSurface".to_owned(),
+        GfxPdu::SolidFill(_) => "SolidFill".to_owned(),
+        GfxPdu::SurfaceToSurface(_) => "SurfaceToSurface".to_owned(),
+        GfxPdu::SurfaceToCache(_) => "SurfaceToCache".to_owned(),
+        GfxPdu::CacheToSurface(_) => "CacheToSurface".to_owned(),
+        GfxPdu::EvictCacheEntry(_) => "EvictCacheEntry".to_owned(),
+        GfxPdu::CacheImportReply(_) => "CacheImportReply".to_owned(),
+        GfxPdu::ResetGraphics(_) => "ResetGraphics".to_owned(),
+        GfxPdu::StartFrame(_) => "StartFrame".to_owned(),
+        GfxPdu::EndFrame(_) => "EndFrame".to_owned(),
+        other => format!("{other:?}")
+            .split(['(', ' '])
+            .next()
+            .unwrap_or("Gfx")
+            .to_owned(),
+    }
+}
 
 // ============================================================================
 // Frame Cropping

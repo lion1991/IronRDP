@@ -145,12 +145,13 @@ fn decode_vbar<'a>(src: &mut ReadCursor<'a>, band_height: u16) -> DecodeResult<V
     }
 
     // Both top bits clear: short V-bar cache miss
-    // Per MS-RDPEGFX 2.2.4.1.1.2.1.1.3 (SHORT_VBAR_CACHE_MISS):
-    //   bits 13:6 = shortVBarYOn (8 bits): row where Short V-Bar begins
-    //   bits 5:0  = shortVBarYOff (6 bits): row where Short V-Bar ends
+    // Per MS-RDPEGFX 2.2.4.1.1.2.1.1.3 (SHORT_VBAR_CACHE_MISS), matching FreeRDP
+    // clear_decompress_bands_data:
+    //   bits 7:0  = shortVBarYOn: row where Short V-Bar begins
+    //   bits 13:8 = shortVBarYOff: row where Short V-Bar ends (exclusive)
     // Pixel count = shortVBarYOff - shortVBarYOn
-    let y_on = u8::try_from(first_word >> 6).expect("top 2 bits are clear, so shifted value fits in u8");
-    let y_off = u8::try_from(first_word & 0x3F).expect("masked to 6 bits, always fits in u8");
+    let y_on = u8::try_from(first_word & 0xFF).expect("masked to 8 bits, always fits in u8");
+    let y_off = u8::try_from((first_word >> 8) & 0x3F).expect("masked to 6 bits, always fits in u8");
 
     if y_off < y_on {
         return Err(invalid_field_err!("shortVBarCacheMiss", "shortVBarYOff < shortVBarYOn"));
@@ -210,10 +211,11 @@ mod tests {
 
     #[test]
     fn decode_vbar_short_cache_miss() {
-        // Both top bits clear: y_on=2, y_off=5, pixel_count = y_off - y_on = 3
+        // MS-RDPEGFX layout: yOn = bits 7:0, yOff = bits 13:8.
+        // y_on=2, y_off=5, pixel_count = y_off - y_on = 3
         let y_on: u16 = 2;
         let y_off: u16 = 5;
-        let first_word = (y_on << 6) | y_off;
+        let first_word = (y_off << 8) | y_on;
         let mut data = Vec::new();
         data.extend_from_slice(&first_word.to_le_bytes());
         // 3 pixels * 3 bytes = 9 bytes BGR data
@@ -225,6 +227,45 @@ mod tests {
                 assert_eq!(miss.y_on, 2);
                 assert_eq!(miss.y_off_delta, 3); // pixel_count = y_off - y_on = 5 - 2 = 3
                 assert_eq!(miss.pixel_data.len(), 9);
+            }
+            _ => panic!("expected ShortCacheMiss"),
+        }
+    }
+
+    #[test]
+    fn decode_vbar_short_cache_miss_spec_example() {
+        // MS-RDPEGFX worked example: vBarHeader = 0x0f00 => yOn=0, yOff=15.
+        // The old (swapped) layout read yOn=60, yOff=0 and wrongly rejected it.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0f00u16.to_le_bytes());
+        data.extend_from_slice(&[0x11; 15 * 3]); // 15 pixels BGR
+        let mut cursor = ReadCursor::new(&data);
+        let vbar = decode_vbar(&mut cursor, 52).unwrap();
+        match vbar {
+            VBar::ShortCacheMiss(miss) => {
+                assert_eq!(miss.y_on, 0);
+                assert_eq!(miss.y_off_delta, 15);
+                assert_eq!(miss.pixel_data.len(), 45);
+            }
+            _ => panic!("expected ShortCacheMiss"),
+        }
+    }
+
+    #[test]
+    fn decode_vbar_short_cache_miss_real_windows_ordering() {
+        // Regression for the swapped-bitfield bug: real Windows sends yOn in the
+        // low byte and yOff in bits 13:8. Here yOn=1, yOff=3 (first_word=0x0301).
+        // Old code computed yOn=12, yOff=1 => "yOff < yOn" false reject.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0301u16.to_le_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // 2 pixels
+        let mut cursor = ReadCursor::new(&data);
+        let vbar = decode_vbar(&mut cursor, 5).unwrap();
+        match vbar {
+            VBar::ShortCacheMiss(miss) => {
+                assert_eq!(miss.y_on, 1);
+                assert_eq!(miss.y_off_delta, 2);
+                assert_eq!(miss.pixel_data.len(), 6);
             }
             _ => panic!("expected ShortCacheMiss"),
         }

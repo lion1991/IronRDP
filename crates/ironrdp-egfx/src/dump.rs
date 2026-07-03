@@ -1,7 +1,7 @@
 //! Env-gated raw EGFX codec payload dumper for offline replay debugging.
 //!
 //! Enable with `NEXSHELL_RDP_EGFX_DUMP=<dir>`. When set, the exact decoder-input
-//! byte slices for the first ~40 ClearCodec (`WireToSurface1`) and first ~40
+//! byte slices for the first ~40 ClearCodec (`WireToSurface1`) and first ~2000
 //! Progressive (`WireToSurface2`) payloads are written as `<seq>_<codec>_...bin`
 //! plus one `meta.jsonl` line each (codec, surface, dims, context id, caps,
 //! runtime error). Replay them offline with the `egfx_replay` example.
@@ -16,7 +16,21 @@ use std::sync::OnceLock;
 
 /// Per-codec cap so a long session doesn't fill the disk; the first frames
 /// (including the cache-independent first PDU) are the diagnostic ones.
-const MAX_PER_CODEC: u64 = 40;
+const MAX_CLEAR: u64 = 40;
+/// Progressive needs a much wider window: the video-playback segment (heavy
+/// diff tiles) starts well past the page-load prefix. Override via
+/// `IRONRDP_EGFX_DUMP_PROG_CAP`.
+const MAX_PROG: u64 = 2000;
+
+fn prog_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("IRONRDP_EGFX_DUMP_PROG_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_PROG)
+    })
+}
 
 fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -60,8 +74,12 @@ pub(crate) fn dump(rec: &DumpRecord<'_>) {
     let Some(dir) = dir() else {
         return;
     };
-    let counter = if rec.codec == "clearcodec" { &CLEAR_N } else { &PROG_N };
-    if counter.fetch_add(1, Ordering::Relaxed) >= MAX_PER_CODEC {
+    let (counter, cap) = if rec.codec == "clearcodec" {
+        (&CLEAR_N, MAX_CLEAR)
+    } else {
+        (&PROG_N, prog_cap())
+    };
+    if counter.fetch_add(1, Ordering::Relaxed) >= cap {
         return;
     }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);

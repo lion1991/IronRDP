@@ -780,7 +780,7 @@ impl GraphicsPipelineClient {
 
         // MS-RDPEGFX 2.2.4.4: only pixels inside avc420MetaData.regionRects are valid in the
         // decoded frame; everything else is encoder garbage (uninitialised YUV → renders green).
-        // Copy each regionRect (surface coords, inclusive) individually — NEVER the whole dest
+        // Copy each regionRect (surface coords, exclusive right/bottom) individually — NEVER the whole dest
         // rect. Mirrors FreeRDP gdi/gfx.c, which does a per-rect YUV→RGB copy.
         // Clone out the rects so `self.h264_decoder` can be borrowed mutably below.
         let region_rects = stream.rectangles.clone();
@@ -1096,11 +1096,15 @@ fn convert_uncompressed_to_rgba(src: &[u8]) -> Vec<u8> {
 
 /// Extract one AVC420 regionRect from a decoded RGBA frame into a tight RGBA buffer.
 ///
-/// `rect` is in surface coordinates with **inclusive** right/bottom (MS-RDPEGFX
-/// RDPGFX_RECT16). The decoded H.264 frame is 16-pixel macroblock aligned, so it may be
-/// larger than the surface; the region is clipped to the frame bounds. Returns the tight
-/// RGBA data plus the region's exclusive-coord origin/size `(data, x, y, w, h)`, or `None`
-/// for an empty / malformed / out-of-frame rect.
+/// `rect` is in surface coordinates with **exclusive** right/bottom: RDPGFX_RECT16 is
+/// exclusive on the wire (FreeRDP's gdi/gfx.c computes width as right-left for AVC420
+/// meta rects) even though the parsed type is named `InclusiveRectangle`. Treating it as
+/// inclusive over-copied one row/column per rect; for full-height rects that row came
+/// from the 16-aligned decoded frame's padding macroblocks (uninitialised YUV), painting
+/// 1px green lines at region edges. The decoded H.264 frame is 16-pixel macroblock
+/// aligned, so it may be larger than the surface; the region is clipped to the frame
+/// bounds. Returns the tight RGBA data plus the region's origin/size `(data, x, y, w, h)`,
+/// or `None` for an empty / malformed / out-of-frame rect.
 #[expect(clippy::as_conversions, reason = "u16/u32 widened to usize for indexing (lossless)")]
 fn extract_region_rgba(
     frame: &[u8],
@@ -1116,9 +1120,9 @@ fn extract_region_rgba(
     let fw = u16::try_from(frame_w).unwrap_or(u16::MAX);
     let fh = u16::try_from(frame_h).unwrap_or(u16::MAX);
     let (left, top) = (rect.left, rect.top);
-    // Inclusive → exclusive, then clip to the decoded frame.
-    let right = rect.right.saturating_add(1).min(fw);
-    let bottom = rect.bottom.saturating_add(1).min(fh);
+    // Exclusive bounds, clipped to the decoded frame.
+    let right = rect.right.min(fw);
+    let bottom = rect.bottom.min(fh);
     if right <= left || bottom <= top {
         return None;
     }
@@ -1240,10 +1244,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_region_inclusive_to_exclusive() {
-        // 4x4 frame; region inclusive (1,1)-(2,2) → exclusive origin (1,1) size 2x2.
+    fn extract_region_exclusive_bounds() {
+        // 4x4 frame; region exclusive (1,1)-(3,3) → origin (1,1) size 2x2.
         let frame = ramp_frame(4, 4);
-        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &incl(1, 1, 2, 2)).unwrap();
+        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &incl(1, 1, 3, 3)).unwrap();
         assert_eq!((x, y, w, h), (1, 1, 2, 2));
         assert_eq!(data.len(), 2 * 2 * 4);
         // Top-left of the region is frame pixel (1,1) → id = 1*4+1 = 5.
@@ -1259,7 +1263,7 @@ mod tests {
         // Frame 1280x736 (16-aligned), surface 1280x732; a region touching the surface's
         // bottom-right stays within the frame and is clipped to the frame if it overshoots.
         let frame = ramp_frame(8, 8);
-        // Inclusive right/bottom of 20 would exceed the 8x8 frame → clipped to 8.
+        // Exclusive right/bottom of 20 would exceed the 8x8 frame → clipped to 8.
         let (data, x, y, w, h) = extract_region_rgba(&frame, 8, 8, &incl(6, 6, 20, 20)).unwrap();
         assert_eq!((x, y), (6, 6));
         assert_eq!((w, h), (2, 2)); // right/bottom clamped to frame edge (exclusive 8).
@@ -1269,7 +1273,7 @@ mod tests {
     #[test]
     fn extract_region_full_frame() {
         let frame = ramp_frame(4, 4);
-        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &incl(0, 0, 3, 3)).unwrap();
+        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &incl(0, 0, 4, 4)).unwrap();
         assert_eq!((x, y, w, h), (0, 0, 4, 4));
         assert_eq!(data, frame);
     }
@@ -1287,6 +1291,22 @@ mod tests {
         let frame = ramp_frame(4, 4);
         // left/top already at/beyond frame edge → clipped away → None.
         assert!(extract_region_rgba(&frame, 4, 4, &incl(4, 4, 5, 5)).is_none());
+    }
+
+    /// 绿线回归锁定：full-height exclusive rect 不得把 16 对齐解码帧的 padding 行拷出来。
+    /// Surface 高 4、解码帧高 8（模拟 1080 vs 1088）：rect bottom=4（exclusive）只取 4 行，
+    /// 第 5 行（padding，未初始化 → 真机呈绿色）绝不能进输出。
+    #[test]
+    fn extract_region_never_copies_frame_padding_rows() {
+        let fw = 4usize;
+        let mut frame = ramp_frame(4, 8);
+        // padding 行（y>=4）填哨兵 0xEE。
+        for px in frame[4 * fw * 4..].chunks_exact_mut(4) {
+            px.copy_from_slice(&[0xEE; 4]);
+        }
+        let (data, _, _, w, h) = extract_region_rgba(&frame, 4, 8, &incl(0, 0, 4, 4)).unwrap();
+        assert_eq!((w, h), (4, 4));
+        assert!(!data.iter().any(|&b| b == 0xEE), "padding rows must not leak into output");
     }
 
     #[test]

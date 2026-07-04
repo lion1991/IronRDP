@@ -9,6 +9,11 @@
 use ironrdp_core::{invalid_field_err, DecodeResult};
 
 /// Decodes an NSCODEC_BITMAP_STREAM into BGRA pixels (`width * height * 4`).
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "AYCoCg color-loss recovery relies on i8 wraparound; remaining casts are post-clamp/u32-to-usize"
+)]
 pub fn decode_nscodec(data: &[u8], width: u16, height: u16) -> DecodeResult<Vec<u8>> {
     if data.len() < 20 {
         return Err(invalid_field_err!("nscodec", "stream shorter than 20-byte header"));
@@ -88,6 +93,10 @@ pub fn decode_nscodec(data: &[u8], width: u16, height: u16) -> DecodeResult<Vec<
 /// NSCodec plane RLE ([MS-RDPNSC] 2.2.2 / FreeRDP `nsc_rle_decode`): a byte
 /// followed by an equal byte starts a run (len byte + 2, or 0xFF marker + LE
 /// u32); the final 4 bytes of every plane are stored raw.
+#[expect(
+    clippy::as_conversions,
+    reason = "u32 run lengths index byte buffers; usize is at least 32 bits on supported targets"
+)]
 fn rle_decode(mut input: &[u8], original_size: usize) -> DecodeResult<Vec<u8>> {
     let mut out = Vec::with_capacity(original_size);
     let mut left = original_size;
@@ -169,7 +178,7 @@ mod tests {
         let n = w * h;
         let mut s = Vec::new();
         for _ in 0..4 {
-            s.extend_from_slice(&(n as u32).to_le_bytes());
+            s.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
         }
         s.push(cll);
         s.push(0); // no chroma subsampling
@@ -230,7 +239,7 @@ mod tests {
         let alpha_n = w * h;
         let mut s = Vec::new();
         for n in [luma_n, chroma_n, chroma_n, alpha_n] {
-            s.extend_from_slice(&(n as u32).to_le_bytes());
+            s.extend_from_slice(&u32::try_from(n).unwrap().to_le_bytes());
         }
         s.extend_from_slice(&[1, 1, 0, 0]); // CLL=1, subsampling on
         let mut luma = vec![0u8; luma_n];

@@ -155,21 +155,24 @@ fn decode_first_components(
 /// # Panics
 ///
 /// Panics if `coefficients` or `sign` has fewer than 4096 elements.
-#[expect(clippy::too_many_arguments, reason = "mirrors FreeRDP's per-component upgrade inputs")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors FreeRDP's per-component upgrade inputs"
+)]
 pub fn decode_upgrade_pass(
     srl_data: &[u8],
     raw_data: &[u8],
     base_quant: &ComponentCodecQuant,
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
-    use_reduce_extrapolate: bool,
+    _use_reduce_extrapolate: bool,
     coefficients: &mut [i16],
     sign: &mut [i8],
 ) {
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
-    let bands = get_band_layout(use_reduce_extrapolate);
+    let bands = upgrade_band_layout();
     let mut srl = SrlDecoder::new(srl_data);
     let mut raw = RawBitReader::new(raw_data);
 
@@ -417,9 +420,9 @@ pub fn encode_upgrade_pass(
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
     sign: &[i8],
-    use_reduce_extrapolate: bool,
+    _use_reduce_extrapolate: bool,
 ) -> (Vec<u8>, Vec<u8>) {
-    let bands = get_band_layout(use_reduce_extrapolate);
+    let bands = upgrade_band_layout();
     let mut srl = SrlEncoder::new();
     let mut raw_writer = RawBitWriter::new();
 
@@ -566,6 +569,12 @@ fn standard_band_layout() -> [BandInfo; NUM_BANDS] {
         b(8, 8),   // HH3: 64
         b(8, 8),   // LL3: 64
     ]
+}
+
+/// FreeRDP decodes Progressive UPGRADE SRL/raw streams in reduce-extrapolate
+/// band order even when the final IDWT uses the standard transform.
+fn upgrade_band_layout() -> [BandInfo; NUM_BANDS] {
+    crate::dwt_extrapolate::band_layout()
 }
 
 /// Starting offset of the LL3 subband for delta decoding.
@@ -1018,6 +1027,52 @@ pub struct DecodedTile {
     pub y_idx: u16,
     /// RGBA pixel data (64x64 = 16384 bytes).
     pub pixels: Vec<u8>,
+    /// Tile-local subrects (REGION rects ∩ this tile) valid for on-screen blit.
+    ///
+    /// FreeRDP `progressive_decompress` clips every tile copy to the REGION
+    /// rects. Blitting the full tile can resurrect stale RFX shadow-state
+    /// content in areas the server has since repainted via another codec
+    /// (ClearCodec/AVC/offscreen cache) — e.g. 1px window-drag outline residue.
+    /// Pixels outside these rects must not reach the surface.
+    pub valid_rects: Vec<TileSubRect>,
+}
+
+/// A tile-local rectangle (offsets within the 64x64 tile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileSubRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Intersect a tile's bounds with the REGION rects, in tile-local coords.
+/// Overlapping rects are kept as-is: double-blitting identical pixels is
+/// harmless, so the effect equals FreeRDP's coalesced region union.
+fn clip_tile_to_region(x_idx: u16, y_idx: u16, rects: &[ironrdp_pdu::codecs::rfx::RfxRectangle]) -> Vec<TileSubRect> {
+    let tx = u32::from(x_idx) * 64;
+    let ty = u32::from(y_idx) * 64;
+    let mut out = Vec::new();
+    for r in rects {
+        let x0 = u32::from(r.x).max(tx);
+        let y0 = u32::from(r.y).max(ty);
+        let x1 = (u32::from(r.x) + u32::from(r.width)).min(tx + 64);
+        let y1 = (u32::from(r.y) + u32::from(r.height)).min(ty + 64);
+        if x1 > x0 && y1 > y0 {
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "values clamped to 64x64 tile bounds"
+            )]
+            out.push(TileSubRect {
+                x: (x0 - tx) as u16,
+                y: (y0 - ty) as u16,
+                w: (x1 - x0) as u16,
+                h: (y1 - y0) as u16,
+            });
+        }
+    }
+    out
 }
 
 /// Per-axis cap on surface dimensions, in pixels.
@@ -1163,11 +1218,7 @@ impl ProgressiveDecoder {
                 ProgressiveBlock::Region(r) => Some(r.uses_reduce_extrapolate()),
                 _ => None,
             })
-            .or_else(|| {
-                self.surfaces
-                    .get(&surface_id)
-                    .map(|c| c.surface.use_reduce_extrapolate)
-            })
+            .or_else(|| self.surfaces.get(&surface_id).map(|c| c.surface.use_reduce_extrapolate))
             .unwrap_or(false);
 
         // Get or create the persistent tile grid for this surface.
@@ -1207,7 +1258,15 @@ impl ProgressiveDecoder {
                     prog_quant_vals,
                     use_reduce_extrapolate,
                 )?;
-                decoded_tiles.extend(tiles);
+                // Clip each tile's paint area to the REGION rects (FreeRDP
+                // semantics). Tiles fully outside the rects still updated
+                // coefficient state above but must paint nothing.
+                for mut tile in tiles {
+                    tile.valid_rects = clip_tile_to_region(tile.x_idx, tile.y_idx, &region.rects);
+                    if !tile.valid_rects.is_empty() {
+                        decoded_tiles.push(tile);
+                    }
+                }
             }
         }
 
@@ -1303,7 +1362,12 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+            Ok(vec![DecodedTile {
+                x_idx,
+                y_idx,
+                pixels,
+                valid_rects: Vec::new(),
+            }])
         }
 
         ProgressiveTile::First(tile) => {
@@ -1339,7 +1403,12 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+            Ok(vec![DecodedTile {
+                x_idx,
+                y_idx,
+                pixels,
+                valid_rects: Vec::new(),
+            }])
         }
 
         ProgressiveTile::Upgrade(tile) => {
@@ -1377,7 +1446,12 @@ fn decode_tile_block(
             let mut pixels = vec![0u8; 64 * 64 * 4];
             tile_state.reconstruct_to_rgba(&mut pixels);
 
-            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+            Ok(vec![DecodedTile {
+                x_idx,
+                y_idx,
+                pixels,
+                valid_rects: Vec::new(),
+            }])
         }
     }
 }
@@ -1396,6 +1470,59 @@ impl Default for ProgressiveDecoder {
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_tile_to_region_intersects_in_tile_local_coords() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        // Tile (1,1) covers pixels x∈[64,128) y∈[64,128).
+        let rects = [
+            // Fully covers the tile → full-tile subrect
+            RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 512,
+                height: 512,
+            },
+        ];
+        assert_eq!(
+            clip_tile_to_region(1, 1, &rects),
+            vec![TileSubRect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64
+            }]
+        );
+
+        // A 4px-wide strip crossing the tile at x=100..104 → local x=36, w=4
+        let strip = [RfxRectangle {
+            x: 100,
+            y: 70,
+            width: 4,
+            height: 200,
+        }];
+        assert_eq!(
+            clip_tile_to_region(1, 1, &strip),
+            vec![TileSubRect {
+                x: 36,
+                y: 6,
+                w: 4,
+                h: 58
+            }]
+        );
+
+        // Rect entirely outside the tile → no subrects (tile paints nothing)
+        let outside = [RfxRectangle {
+            x: 200,
+            y: 200,
+            width: 32,
+            height: 32,
+        }];
+        assert!(clip_tile_to_region(1, 1, &outside).is_empty());
+
+        // No rects at all → nothing painted
+        assert!(clip_tile_to_region(1, 1, &[]).is_empty());
+    }
 
     #[test]
     fn surface_tiles_rejects_over_cap_dimensions() {
@@ -1508,6 +1635,35 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_pass_uses_freerdp_band_order_even_without_extrapolate_dwt() {
+        let mut coefficients = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = vec![SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
+        let base_quant = ComponentCodecQuant {
+            lh1: 1,
+            ..ComponentCodecQuant::LOSSLESS
+        };
+        let prev_prog = ComponentCodecQuant {
+            lh1: 1,
+            ..ComponentCodecQuant::LOSSLESS
+        };
+        let curr_prog = ComponentCodecQuant::LOSSLESS;
+
+        decode_upgrade_pass(
+            &[],
+            &[0x80],
+            &base_quant,
+            &prev_prog,
+            &curr_prog,
+            false,
+            &mut coefficients,
+            &mut sign,
+        );
+
+        assert_eq!(coefficients[1023], 1);
+        assert_eq!(coefficients[1024], 0);
+    }
+
+    #[test]
     fn progressive_quantize_round_trip() {
         let mut coefficients = vec![0i16; 4096];
         for (i, c) in coefficients.iter_mut().enumerate() {
@@ -1597,8 +1753,7 @@ mod tests {
         target[1] = 1000 + step; // positive-DAS -> raw mag 1
         target[2] = -1000 - step; // negative-DAS -> raw mag 1
 
-        let (srl_data, raw_data) =
-            encode_upgrade_pass(&target, &prev_c, &base, &prev_prog, &curr_prog, &sign, false);
+        let (srl_data, raw_data) = encode_upgrade_pass(&target, &prev_c, &base, &prev_prog, &curr_prog, &sign, false);
 
         let mut coeffs = prev_c.clone();
         let mut dsign = sign.clone();
@@ -1634,14 +1789,22 @@ mod tests {
         let coeffs0 = vec![7i16; 4096];
         let sign = vec![SIGN_POSITIVE; 4096];
 
-        let (srl_data, raw_data) =
-            encode_upgrade_pass(&coeffs0, &coeffs0, &base, &prog, &prog, &sign, false);
+        let (srl_data, raw_data) = encode_upgrade_pass(&coeffs0, &coeffs0, &base, &prog, &prog, &sign, false);
         assert!(srl_data.is_empty());
         assert!(raw_data.is_empty());
 
         let mut coeffs = coeffs0.clone();
         let mut dsign = sign;
-        decode_upgrade_pass(&srl_data, &raw_data, &base, &prog, &prog, false, &mut coeffs, &mut dsign);
+        decode_upgrade_pass(
+            &srl_data,
+            &raw_data,
+            &base,
+            &prog,
+            &prog,
+            false,
+            &mut coeffs,
+            &mut dsign,
+        );
         assert_eq!(coeffs, coeffs0);
     }
 
@@ -2176,14 +2339,19 @@ mod tests {
     fn progressive_decoder_region_without_context_decodes() {
         use ironrdp_pdu::codecs::rfx::RfxRectangle;
         use ironrdp_pdu::codecs::rfx::progressive::{
-            ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveRegion,
-            ProgressiveTile, TileSimple, encode_progressive_stream,
+            ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveTile,
+            TileSimple, encode_progressive_stream,
         };
 
         let comp = encode_component([48i16; COEFFICIENTS_PER_COMPONENT]);
         let region = ProgressiveRegion {
             tile_size: 0x40,
-            rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+            rects: vec![RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }],
             quant_vals: vec![ComponentCodecQuant::LOSSLESS],
             quant_prog_vals: vec![],
             flags: 0,
@@ -2202,7 +2370,10 @@ mod tests {
         };
         // No SYNC, no CONTEXT: just FrameBegin/Region/FrameEnd.
         let blocks = vec![
-            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu { frame_index: 0, region_count: 1 }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
             ProgressiveBlock::Region(region),
             ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
         ];
@@ -2222,8 +2393,7 @@ mod tests {
         use ironrdp_pdu::codecs::rfx::RfxRectangle;
         use ironrdp_pdu::codecs::rfx::progressive::{
             ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
-            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, TileUpgrade,
-            encode_progressive_stream,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, TileUpgrade, encode_progressive_stream,
         };
 
         let comp = encode_component([48i16; COEFFICIENTS_PER_COMPONENT]);
@@ -2232,7 +2402,12 @@ mod tests {
         // Frame 1: simple tile establishes first-pass state; CONTEXT ctx_id 1.
         let region1 = ProgressiveRegion {
             tile_size: 0x40,
-            rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+            rects: vec![RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }],
             quant_vals: vec![ComponentCodecQuant::LOSSLESS],
             quant_prog_vals: vec![],
             flags: 0,
@@ -2251,8 +2426,15 @@ mod tests {
         };
         let f1 = encode_progressive_stream(&[
             ProgressiveBlock::Sync(ProgressiveSyncPdu),
-            ProgressiveBlock::Context(ProgressiveContextPdu { context_id: 1, tile_size: 0x40, flags: 0 }),
-            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu { frame_index: 0, region_count: 1 }),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 1,
+                tile_size: 0x40,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
             ProgressiveBlock::Region(region1),
             ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
         ])
@@ -2264,7 +2446,12 @@ mod tests {
         // the surface's first-pass state persisted.
         let region2 = ProgressiveRegion {
             tile_size: 0x40,
-            rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+            rects: vec![RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }],
             quant_vals: vec![ComponentCodecQuant::LOSSLESS],
             quant_prog_vals: vec![],
             flags: 0,
@@ -2284,8 +2471,15 @@ mod tests {
             })],
         };
         let f2 = encode_progressive_stream(&[
-            ProgressiveBlock::Context(ProgressiveContextPdu { context_id: 7, tile_size: 0x40, flags: 0 }),
-            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu { frame_index: 1, region_count: 1 }),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 7,
+                tile_size: 0x40,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 1,
+                region_count: 1,
+            }),
             ProgressiveBlock::Region(region2),
             ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
         ])

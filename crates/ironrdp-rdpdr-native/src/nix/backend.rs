@@ -93,6 +93,35 @@ impl RdpdrBackend for NixRdpdrBackend {
     }
 }
 
+/// Safely resolve a server-provided relative path under `file_base`.
+/// Lexical normalization per component: skip `.`/empty, pop on `..`
+/// (empty stack means the path escaped base -> None), push normal segments.
+/// Segments never contain '/', so rebuilding cannot be reset by an absolute
+/// or UNC segment. Prevents path traversal out of the shared directory.
+fn resolve_in_base(file_base: &str, server_rel: &str) -> Option<String> {
+    use std::path::PathBuf;
+    let rel = server_rel.replace('\\', "/");
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in rel.split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+    let mut full = PathBuf::from(file_base);
+    for seg in &stack {
+        full.push(seg);
+    }
+    // Defense in depth: the normalized path must still live under base.
+    if !full.starts_with(file_base) {
+        return None;
+    }
+    Some(full.to_string_lossy().into_owned())
+}
+
 pub(crate) fn write_device(backend: &mut NixRdpdrBackend, req_inner: DeviceWriteRequest) -> PduResult<Vec<SvcMessage>> {
     return process_dependent_file(
         backend,
@@ -407,8 +436,18 @@ pub(crate) fn set_information(
         Some(file) => {
             match &req_inner.set_buffer {
                 FileInformationClass::Rename(info) => {
-                    let mut to = backend.file_base.clone();
-                    to.push_str(&info.file_name.replace('\\', "/"));
+                    // Sandbox: reject rename targets that escape the shared base.
+                    let to = match resolve_in_base(&backend.file_base, &info.file_name) {
+                        Some(p) => p,
+                        None => {
+                            warn!("rdpdr: rejected path traversal in rename: {}", info.file_name);
+                            let res = RdpdrPdu::ClientDriveSetInformationResponse(
+                                ClientDriveSetInformationResponse::new(&req_inner, NtStatus::ACCESS_DENIED)
+                                    .map_err(|e| encode_err!(e))?,
+                            );
+                            return Ok(vec![SvcMessage::from(res)]);
+                        }
+                    };
                     if let Err(error) = std::fs::rename(file, to) {
                         warn!(?error, "Rename file error");
                         let res = RdpdrPdu::ClientDriveSetInformationResponse(
@@ -578,12 +617,31 @@ pub(crate) fn query_directory(
             let mut find_file_name = None;
             if req_inner.initial_query > 0 {
                 if req_inner.path.ends_with('*') {
-                    let mut parent = backend.file_base.clone();
                     let query_path = req_inner.path.replace('\\', "/");
                     let len = query_path.len();
                     // path ends with *, so its len > 0
                     #[expect(clippy::arithmetic_side_effects)]
-                    parent.push_str(&query_path[0..len - 1]);
+                    let dir_rel = &query_path[0..len - 1];
+                    // Sandbox: reject listing targets that escape the shared base.
+                    let mut parent = match resolve_in_base(&backend.file_base, dir_rel) {
+                        Some(p) => p,
+                        None => {
+                            warn!("rdpdr: rejected path traversal in query_directory: {}", req_inner.path);
+                            return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
+                                ClientDriveQueryDirectoryResponse {
+                                    device_io_reply: DeviceIoResponse::new(
+                                        req_inner.device_io_request,
+                                        NtStatus::ACCESS_DENIED,
+                                    ),
+                                    buffer: None,
+                                },
+                            ))]);
+                        }
+                    };
+                    // resolve strips the trailing slash; restore it so the entry name appends cleanly.
+                    if !parent.ends_with('/') {
+                        parent.push('/');
+                    }
                     if let Ok(dirp) = Dir::open(
                         parent.as_str(),
                         nix::fcntl::OFlag::O_RDONLY,
@@ -604,9 +662,22 @@ pub(crate) fn query_directory(
                         backend.file_dir_map.insert(req_inner.device_io_request.file_id, iter);
                     }
                 } else {
-                    let mut full_path = backend.file_base.clone();
-                    let query_path = req_inner.path.replace('\\', "/");
-                    full_path.push_str(&query_path);
+                    // Sandbox: reject query targets that escape the shared base.
+                    let full_path = match resolve_in_base(&backend.file_base, &req_inner.path) {
+                        Some(p) => p,
+                        None => {
+                            warn!("rdpdr: rejected path traversal in query_directory: {}", req_inner.path);
+                            return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
+                                ClientDriveQueryDirectoryResponse {
+                                    device_io_reply: DeviceIoResponse::new(
+                                        req_inner.device_io_request,
+                                        NtStatus::ACCESS_DENIED,
+                                    ),
+                                    buffer: None,
+                                },
+                            ))]);
+                        }
+                    };
                     find_file_name = Some(full_path);
                 }
                 make_query_dir_resp(
@@ -675,8 +746,21 @@ pub(crate) fn create_drive(
 ) -> PduResult<Vec<SvcMessage>> {
     let file_id = backend.file_id;
     backend.file_id += 1;
-    let mut path = String::from(backend.file_base.as_str());
-    path.push_str(&req_inner.path.replace('\\', "/"));
+    // Sandbox: reject server paths that escape the shared base.
+    let path = match resolve_in_base(&backend.file_base, &req_inner.path) {
+        Some(p) => p,
+        None => {
+            warn!("rdpdr: rejected path traversal in create: {}", req_inner.path);
+            let io_response = DeviceIoResponse::new(req_inner.device_io_request, NtStatus::ACCESS_DENIED);
+            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(
+                DeviceCreateResponse {
+                    device_io_reply: io_response,
+                    file_id,
+                    information: Information::empty(),
+                },
+            ))]);
+        }
+    };
     // first process directory
     match std::fs::metadata(&path) {
         Ok(meta) => {
@@ -799,5 +883,37 @@ pub(crate) fn process_dependent_file(
     match backend.file_map.get_mut(&request.file_id) {
         None => error_fx(request),
         Some(file) => fx(file, request),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_in_base;
+
+    #[test]
+    fn resolve_in_base_maps_legit_paths() {
+        assert_eq!(resolve_in_base("/base", "/a/b.txt"), Some("/base/a/b.txt".to_owned()));
+        // backslashes are normalized to forward slashes
+        assert_eq!(resolve_in_base("/base", "\\a\\b"), Some("/base/a/b".to_owned()));
+        // single-dot components are dropped
+        assert_eq!(resolve_in_base("/base", "/a/./b"), Some("/base/a/b".to_owned()));
+    }
+
+    #[test]
+    fn resolve_in_base_allows_inbound_parent() {
+        // `..` that stays within base is fine
+        assert_eq!(resolve_in_base("/base", "/a/../b"), Some("/base/b".to_owned()));
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_traversal() {
+        assert_eq!(resolve_in_base("/base", "/../etc/passwd"), None);
+        assert_eq!(resolve_in_base("/base", "/a/../../x"), None);
+    }
+
+    #[test]
+    fn resolve_in_base_empty_maps_to_base() {
+        assert_eq!(resolve_in_base("/base", ""), Some("/base".to_owned()));
+        assert_eq!(resolve_in_base("/base", "/"), Some("/base".to_owned()));
     }
 }

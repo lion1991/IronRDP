@@ -59,6 +59,7 @@ pub struct Rdpsnd {
     handler: Box<dyn RdpsndClientHandler>,
     state: RdpsndState,
     server_format: Option<ServerAudioFormatPdu>,
+    client_formats: Vec<AudioFormat>,
 }
 
 impl Rdpsnd {
@@ -69,19 +70,24 @@ impl Rdpsnd {
             handler,
             state: RdpsndState::Start,
             server_format: None,
+            client_formats: Vec::new(),
         }
     }
 
     pub fn get_format(&self, format_no: u16) -> PduResult<&AudioFormat> {
-        let server_format = self
-            .server_format
-            .as_ref()
-            .ok_or_else(|| pdu_other_err!("invalid state - no format"))?;
-
-        server_format
-            .formats
+        self.client_formats
             .get(usize::from(format_no))
             .ok_or_else(|| pdu_other_err!("invalid format"))
+    }
+
+    fn get_handler_format_no(&self, format_no: u16) -> PduResult<usize> {
+        let client_format = self.get_format(format_no)?;
+
+        self.handler
+            .get_formats()
+            .iter()
+            .position(|format| format == client_format)
+            .ok_or_else(|| pdu_other_err!("invalid client format"))
     }
 
     pub fn version(&self) -> PduResult<pdu::Version> {
@@ -96,15 +102,22 @@ impl Rdpsnd {
     pub fn client_formats(&mut self) -> PduResult<RdpsndSvcMessages> {
         // Windows seems to be confused if the client replies with more formats, or unknown formats (e.g.: opus).
         // We ensure to only send supported formats in common with the server.
-        let server_format: HashSet<_> = self
-            .server_format
-            .as_ref()
-            .ok_or_else(|| pdu_other_err!("invalid state - no server format"))?
-            .formats
-            .iter()
-            .collect();
-        let formats: HashSet<_> = self.handler.get_formats().iter().collect();
-        let formats = formats.intersection(&server_format).map(|&x| x.clone()).collect();
+        let formats = {
+            let server_format: HashSet<_> = self
+                .server_format
+                .as_ref()
+                .ok_or_else(|| pdu_other_err!("invalid state - no server format"))?
+                .formats
+                .iter()
+                .collect();
+            self.handler
+                .get_formats()
+                .iter()
+                .filter(|format| server_format.contains(format))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        self.client_formats = formats.clone();
 
         let pdu = pdu::ClientAudioFormatPdu {
             version: self.version()?,
@@ -193,7 +206,7 @@ impl SvcProcessor for Rdpsnd {
                 match pdu {
                     // TODO: handle WaveInfo for < v8
                     pdu::ServerAudioOutputPdu::Wave2(pdu) => {
-                        let format_no = usize::from(pdu.format_no);
+                        let format_no = self.get_handler_format_no(pdu.format_no)?;
                         let ts = pdu.audio_timestamp;
                         self.handler.wave(format_no, ts, pdu.data);
                         return Ok(self.wave_confirm(pdu.timestamp, pdu.block_no)?.into());

@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 use ironrdp_core::{decode, encode_vec};
-use ironrdp_rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+use ironrdp_rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler};
 use ironrdp_rdpsnd::pdu;
 use ironrdp_svc::SvcProcessor as _;
 use rstest::rstest;
@@ -22,6 +23,26 @@ fn encoded_server_formats(version: pdu::Version) -> Vec<u8> {
             bits_per_sample: 16,
             data: None,
         }],
+    }))
+    .unwrap()
+}
+
+fn audio_format(format: pdu::WaveFormat, samples_per_sec: u32) -> pdu::AudioFormat {
+    pdu::AudioFormat {
+        format,
+        n_channels: 2,
+        n_samples_per_sec: samples_per_sec,
+        n_avg_bytes_per_sec: samples_per_sec * 4,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: None,
+    }
+}
+
+fn encoded_server_format_list(version: pdu::Version, formats: Vec<pdu::AudioFormat>) -> Vec<u8> {
+    encode_vec(&pdu::ServerAudioOutputPdu::AudioFormat(pdu::ServerAudioFormatPdu {
+        version,
+        formats,
     }))
     .unwrap()
 }
@@ -95,7 +116,9 @@ fn encoded_wave() -> Vec<u8> {
 
 // Drive the client state machine from Start through to Ready.
 fn client_in_ready(version: pdu::Version) -> Rdpsnd {
-    let mut client = Rdpsnd::new(Box::new(NoopRdpsndBackend));
+    let mut client = Rdpsnd::new(Box::new(FormatBackend {
+        formats: vec![audio_format(pdu::WaveFormat::PCM, 44100)],
+    }));
     client.process(&encoded_server_formats(version)).unwrap();
     client.process(&encoded_training()).unwrap();
     client
@@ -106,7 +129,9 @@ fn client_in_start() -> Rdpsnd {
 }
 
 fn client_in_waiting() -> Rdpsnd {
-    let mut client = Rdpsnd::new(Box::new(NoopRdpsndBackend));
+    let mut client = Rdpsnd::new(Box::new(FormatBackend {
+        formats: vec![audio_format(pdu::WaveFormat::PCM, 44100)],
+    }));
     client.process(&encoded_server_formats(pdu::Version::V8)).unwrap();
     client
 }
@@ -133,6 +158,47 @@ fn decode_single_response(responses: &[ironrdp_svc::SvcMessage]) -> pdu::ClientA
     assert_eq!(responses.len(), 1);
     let encoded = responses[0].encode_unframed_pdu().unwrap();
     decode(&encoded).unwrap()
+}
+
+#[derive(Debug)]
+struct FormatBackend {
+    formats: Vec<pdu::AudioFormat>,
+}
+
+impl RdpsndClientHandler for FormatBackend {
+    fn get_formats(&self) -> &[pdu::AudioFormat] {
+        &self.formats
+    }
+
+    fn wave(&mut self, _format_no: usize, _ts: u32, _data: Cow<'_, [u8]>) {}
+
+    fn set_volume(&mut self, _volume: pdu::VolumePdu) {}
+
+    fn set_pitch(&mut self, _pitch: pdu::PitchPdu) {}
+
+    fn close(&mut self) {}
+}
+
+#[derive(Debug)]
+struct RecordingBackend {
+    formats: Vec<pdu::AudioFormat>,
+    wave_format_no: Arc<Mutex<Option<usize>>>,
+}
+
+impl RdpsndClientHandler for RecordingBackend {
+    fn get_formats(&self) -> &[pdu::AudioFormat] {
+        &self.formats
+    }
+
+    fn wave(&mut self, format_no: usize, _ts: u32, _data: Cow<'_, [u8]>) {
+        *self.wave_format_no.lock().unwrap() = Some(format_no);
+    }
+
+    fn set_volume(&mut self, _volume: pdu::VolumePdu) {}
+
+    fn set_pitch(&mut self, _pitch: pdu::PitchPdu) {}
+
+    fn close(&mut self) {}
 }
 
 // ============================================================================
@@ -191,6 +257,26 @@ fn ready_training_sends_confirm() {
     // Verify the client remains in Ready.
     let responses = client.process(&encoded_wave2(1)).unwrap();
     assert_eq!(responses.len(), 1);
+}
+
+#[test]
+fn wave_format_no_is_resolved_against_advertised_client_formats() {
+    let wave_format_no = Arc::new(Mutex::new(None));
+    let mut client = Rdpsnd::new(Box::new(RecordingBackend {
+        formats: vec![
+            audio_format(pdu::WaveFormat::OPUS, 48000),
+            audio_format(pdu::WaveFormat::PCM, 44100),
+        ],
+        wave_format_no: Arc::clone(&wave_format_no),
+    }));
+
+    let server_formats = encoded_server_format_list(pdu::Version::V8, vec![audio_format(pdu::WaveFormat::PCM, 44100)]);
+    client.process(&server_formats).unwrap();
+    client.process(&encoded_training()).unwrap();
+
+    client.process(&encoded_wave2(1)).unwrap();
+
+    assert_eq!(*wave_format_no.lock().unwrap(), Some(1));
 }
 
 // Ready -> AudioFormat -> QualityMode -> Training -> Wave2

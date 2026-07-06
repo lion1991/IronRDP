@@ -424,7 +424,10 @@ impl Default for ChunkProcessor {
 
 /// Builds the [`ChannelOptions`] bitfield to be used in the [`ChannelDef`] structure.
 pub fn make_channel_options(channel: &StaticVirtualChannel) -> ChannelOptions {
-    match channel.compression_condition() {
+    // Match mstsc/FreeRDP: always advertise INITIALIZED | ENCRYPT_RDP. Some server-side
+    // components (e.g. audio redirection) may not bind to a channel declared with empty options.
+    let base = ChannelOptions::INITIALIZED | ChannelOptions::ENCRYPT_RDP;
+    base | match channel.compression_condition() {
         CompressionCondition::Never => ChannelOptions::empty(),
         CompressionCondition::WhenRdpDataIsCompressed => ChannelOptions::COMPRESS_RDP,
         CompressionCondition::Always => ChannelOptions::COMPRESS,

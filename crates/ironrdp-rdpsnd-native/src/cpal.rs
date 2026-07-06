@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use cpal::traits::{DeviceTrait as _, HostTrait as _};
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use ironrdp_error::bail;
 use ironrdp_rdpsnd::client::RdpsndClientHandler;
@@ -97,6 +97,11 @@ impl RdpsndClientHandler for RdpsndBackend {
                         return;
                     }
                 };
+                // Some hosts (e.g. CoreAudio) do not start the stream until play() is called.
+                if let Err(error) = stream.stream().play() {
+                    error!(%error, "Failed to start the audio stream");
+                    return;
+                }
                 debug!("Stream thread parking loop");
                 while !stream_ended.load(Ordering::Relaxed) {
                     thread::park();

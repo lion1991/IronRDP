@@ -72,9 +72,12 @@ impl RdpdrBackend for NixRdpdrBackend {
                     output_buffer: None,
                 }),
             )]),
-            ServerDriveIoRequest::ServerDriveLockControlRequest(_) => {
-                // TODO
-                Ok(Vec::new())
+            ServerDriveIoRequest::ServerDriveLockControlRequest(req_inner) => {
+                // Byte-range locks are not enforced; complete with success like FreeRDP so the
+                // server never blocks waiting for a reply (Explorer locks streams after writes).
+                Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveLockControlResponse(
+                    ClientDriveLockControlResponse::new(req_inner.device_io_request, NtStatus::SUCCESS),
+                ))])
             }
             ServerDriveIoRequest::ServerDriveQuerySecurityRequest(req_inner) => Ok(vec![SvcMessage::from(
                 RdpdrPdu::ClientDriveQuerySecurityResponse(ClientDriveQuerySecurityResponse {

@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use ironrdp_core::{Decode as _, Encode, ReadCursor, WriteCursor, encode_vec};
 use ironrdp_dvc::DvcProcessor as _;
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface};
@@ -20,15 +22,21 @@ struct TestHandler {
     bitmaps_received: Vec<(u16, Codec1Type)>,
     frames_completed: Vec<u32>,
     reset_count: u32,
+    pipeline_errors: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestHandler {
     fn new() -> Self {
+        Self::with_error_sink(Arc::default())
+    }
+
+    fn with_error_sink(pipeline_errors: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
             caps_confirmed: false,
             bitmaps_received: Vec::new(),
             frames_completed: Vec::new(),
             reset_count: 0,
+            pipeline_errors,
         }
     }
 }
@@ -56,6 +64,10 @@ impl GraphicsPipelineHandler for TestHandler {
 
     fn on_close(&mut self) {}
     fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+
+    fn on_pipeline_error(&mut self, detail: &str) {
+        self.pipeline_errors.lock().unwrap().push(detail.to_owned());
+    }
 }
 
 // ============================================================================
@@ -111,7 +123,19 @@ fn setup_active_client_with_surface(
     width: u16,
     height: u16,
 ) -> GraphicsPipelineClient {
-    let handler = TestHandler::new();
+    setup_active_client_with_error_sink(decoder, surface_id, width, height).0
+}
+
+/// Like [`setup_active_client_with_surface`], also returning the handler's
+/// `on_pipeline_error` sink.
+fn setup_active_client_with_error_sink(
+    decoder: Option<Box<dyn H264Decoder>>,
+    surface_id: u16,
+    width: u16,
+    height: u16,
+) -> (GraphicsPipelineClient, Arc<Mutex<Vec<String>>>) {
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let handler = TestHandler::with_error_sink(Arc::clone(&errors));
     let mut client = GraphicsPipelineClient::new(Box::new(handler), decoder);
 
     // Activate via CapabilitiesConfirm
@@ -133,7 +157,7 @@ fn setup_active_client_with_surface(
         .process(0, &encode_for_process(&create))
         .expect("create surface should succeed");
 
-    client
+    (client, errors)
 }
 
 // ============================================================================
@@ -396,7 +420,7 @@ fn client_resets_surfaces_via_process() {
 
 #[test]
 fn client_rejects_wire_to_unknown_surface() {
-    let mut client = setup_active_client_with_surface(None, 1, 4, 4);
+    let (mut client, errors) = setup_active_client_with_error_sink(None, 1, 4, 4);
 
     let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
         surface_id: 99, // does not exist
@@ -410,13 +434,17 @@ fn client_rejects_wire_to_unknown_surface() {
         },
         bitmap_data: vec![0u8; 4 * 4 * 4],
     });
+    // EGFX failures are non-fatal: the PDU is skipped and reported via on_pipeline_error.
     let result = client.process(0, &encode_for_process(&pdu));
-    assert!(result.is_err(), "should reject write to nonexistent surface");
+    assert!(result.is_ok(), "unknown surface must not end the session");
+    let errors = errors.lock().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("WireToSurface1"), "{}", errors[0]);
 }
 
 #[test]
 fn client_rejects_invalid_rectangle_ordering() {
-    let mut client = setup_active_client_with_surface(None, 1, 100, 100);
+    let (mut client, errors) = setup_active_client_with_error_sink(None, 1, 100, 100);
 
     // left > right
     let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
@@ -432,7 +460,8 @@ fn client_rejects_invalid_rectangle_ordering() {
         bitmap_data: vec![0u8; 4],
     });
     let result = client.process(0, &encode_for_process(&pdu));
-    assert!(result.is_err(), "left > right should be rejected");
+    assert!(result.is_ok(), "left > right is skipped, not fatal");
+    assert_eq!(errors.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -493,8 +522,6 @@ fn client_dispatches_clearcodec_via_process() {
 
 #[test]
 fn client_clearcodec_produces_rgba_output() {
-    use std::sync::{Arc, Mutex};
-
     #[derive(Default)]
     struct CapturedBitmap {
         data: Option<Vec<u8>>,

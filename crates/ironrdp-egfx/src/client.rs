@@ -2143,7 +2143,9 @@ mod tests {
         let mut client = progressive_client();
         wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
         clear(&mut client);
-        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_err());
+        // The DWT mode comes from REGION flags, so a fresh surface decodes from
+        // scratch even without SYNC + CONTEXT; only the old tiles are gone.
+        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_ok());
     }
 
     #[test]

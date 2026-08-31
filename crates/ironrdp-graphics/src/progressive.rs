@@ -1335,7 +1335,10 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // Extract the band-layout flag from the CONTEXT block when present.
+        // Extract the band-layout flag. Per MS-RDPEGFX 2.2.4.2.3 the REGION block's
+        // flags bit 0 is RFX_DWT_REDUCE_EXTRAPOLATE, while the CONTEXT block's bit 0
+        // is RFX_SUBBAND_DIFFING; prefer REGION and keep CONTEXT only as a fallback
+        // for servers that omit REGION on a frame.
         // Per MS-RDPEGFX 2.2.4.2 the SYNC + CONTEXT blocks establish a codec
         // context once (keyed by `(surface_id, codec_context_id)`) and are not
         // required to be
@@ -1351,10 +1354,18 @@ impl ProgressiveDecoder {
         // deletes the previous one, and never repeats SYNC + CONTEXT, so a per-context lookup
         // alone rejects the new context. The retained value is scoped to its surface and
         // released with it. Only error when no source is available at all.
-        let signalled = blocks.iter().find_map(|block| match block {
-            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
-            _ => None,
-        });
+        let signalled = blocks
+            .iter()
+            .find_map(|block| match block {
+                ProgressiveBlock::Region(region) => Some(region.uses_reduce_extrapolate()),
+                _ => None,
+            })
+            .or_else(|| {
+                blocks.iter().find_map(|block| match block {
+                    ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
+                    _ => None,
+                })
+            });
         if let Some(flag) = signalled {
             self.surface_context_flags.insert(surface_id, flag);
         }
@@ -2245,19 +2256,30 @@ mod tests {
     }
 
     #[test]
-    fn decoder_context_fallback_is_scoped_by_surface() {
+    fn decoder_region_flag_suffices_without_context() {
+        // REGION carries RFX_DWT_REDUCE_EXTRAPOLATE, so a fresh surface decodes
+        // even when the server never sent a CONTEXT block.
         let mut decoder = ProgressiveDecoder::new();
         let stream_with_context = minimal_progressive_stream(true);
         let stream_without_context = minimal_progressive_stream(false);
 
         assert!(decoder.decode_bitmap(1, 0, 640, 480, &stream_with_context).is_ok());
-        assert!(matches!(
-            decoder.decode_bitmap(2, 0, 640, 480, &stream_without_context),
-            Err(ProgressiveDecodeError::MissingBlock("CONTEXT"))
-        ));
-
-        assert!(decoder.decode_bitmap(2, 0, 640, 480, &stream_with_context).is_ok());
         assert!(decoder.decode_bitmap(2, 0, 640, 480, &stream_without_context).is_ok());
+        assert!(decoder.decode_bitmap(2, 0, 640, 480, &stream_with_context).is_ok());
+    }
+
+    #[test]
+    fn decoder_prefers_region_flag_over_context_flag() {
+        // CONTEXT bit 0 is RFX_SUBBAND_DIFFING, not the DWT mode: a set bit
+        // there must not switch the surface to reduce-extrapolate.
+        let mut decoder = ProgressiveDecoder::new();
+        let stream = flagged_tile_stream(Some(0x01), 0);
+        assert!(decoder.decode_bitmap(1, 0, 64, 64, &stream).is_ok());
+        assert!(!decoder.contexts[&(1, 0)].surface.use_reduce_extrapolate);
+
+        let stream = flagged_tile_stream(Some(0x00), 0x01);
+        assert!(decoder.decode_bitmap(2, 0, 64, 64, &stream).is_ok());
+        assert!(decoder.contexts[&(2, 0)].surface.use_reduce_extrapolate);
     }
 
     fn rect(x: u16, y: u16, width: u16, height: u16) -> ironrdp_pdu::codecs::rfx::RfxRectangle {
@@ -2891,7 +2913,16 @@ mod tests {
         let curr_prog = ComponentCodecQuant::LOSSLESS;
 
         // Only LH1 refines by one raw bit; no zero DAS so no SRL stream.
-        decode_upgrade_pass(&[], &[0x80], &prev_prog, &curr_prog, false, &mut coefficients, &mut sign).unwrap();
+        decode_upgrade_pass(
+            &[],
+            &[0x80],
+            &prev_prog,
+            &curr_prog,
+            false,
+            &mut coefficients,
+            &mut sign,
+        )
+        .unwrap();
 
         // Extrapolate layout: HL1 is 31x33 = 1023, so LH1 starts at 1023, not 1024.
         assert_eq!(coefficients[1023], 1);
@@ -3295,6 +3326,57 @@ mod tests {
             ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
         ]);
 
+        encode_progressive_stream(&blocks).expect("synthetic progressive stream should encode")
+    }
+
+    /// Simple-tile stream with explicit CONTEXT (if any) and REGION flag bytes.
+    fn flagged_tile_stream(context_flags: Option<u8>, region_flags: u8) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, encode_progressive_stream,
+        };
+
+        let component_data = [64i16, -16, 24].map(encode_full_quality_component);
+        let mut blocks = vec![ProgressiveBlock::Sync(ProgressiveSyncPdu)];
+        if let Some(flags) = context_flags {
+            blocks.push(ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags,
+            }));
+        }
+        blocks.extend([
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 0x40,
+                rects: vec![RfxRectangle {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 64,
+                }],
+                quant_vals: vec![ComponentCodecQuant::LOSSLESS],
+                quant_prog_vals: vec![],
+                flags: region_flags,
+                tiles: vec![ProgressiveTile::Simple(TileSimple {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx: 0,
+                    y_idx: 0,
+                    flags: 0,
+                    y_data: &component_data[0],
+                    cb_data: &component_data[1],
+                    cr_data: &component_data[2],
+                    tail_data: &[],
+                })],
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ]);
         encode_progressive_stream(&blocks).expect("synthetic progressive stream should encode")
     }
 

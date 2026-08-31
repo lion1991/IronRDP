@@ -408,16 +408,18 @@ fn dwt_col(
 // Helper
 // ---------------------------------------------------------------------------
 
-/// Truncate i32 to i16 (matches the `i32_to_i16_possible_truncation` pattern
-/// in the existing `dwt.rs`). DWT coefficients stay within i16 range for
-/// typical image data; truncation handles rare overflow gracefully.
+/// Saturating i32 -> i16 for the lifting steps (FreeRDP `clampi16`).
+///
+/// A coarse first pass can push `2*H` / average terms past i16; wrapping flips
+/// the sign and yields checkerboard / false-color tiles, saturating keeps the
+/// reconstruction bounded.
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    reason = "intentional truncation matching existing DWT convention"
+    reason = "value is clamped to the i16 range before the cast"
 )]
 fn t(value: i32) -> i16 {
-    value as i16
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 // ---------------------------------------------------------------------------

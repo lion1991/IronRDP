@@ -83,20 +83,21 @@ impl ClearCodecDecoder {
                 .get(glyph_index)
                 .ok_or_else(|| invalid_field_err!("glyphIndex", "glyph cache miss on hit"))?;
             // MS-RDPEGFX 4.1.1.5 stores a glyph as a dimensionless linear pixel stream, so the
-            // destination rectangle supplies the shape and any rectangle of the same area is
-            // valid (a glyph cached at 2x8 may be hit as 4x4). Only the pixel count has to
-            // agree. Dividing the cached length rather than multiplying `pixel_count` keeps this
-            // free of overflow: the per-axis cap below has not been applied yet, so
-            // `pixel_count` can still be as large as 65535 * 65535, which times four does not
-            // fit a 32-bit usize.
-            if entry.pixels.len() / 4 != pixel_count {
+            // destination rectangle supplies the shape and any rectangle whose area fits is
+            // valid (a glyph cached at 2x8 may be hit as 4x4 or 2x2). FreeRDP clear.c checks
+            // `nWidth * nHeight > glyphEntry->count`, so a smaller destination takes a prefix
+            // of the cached pixels. Dividing the cached length rather than multiplying
+            // `pixel_count` keeps this free of overflow: the per-axis cap below has not been
+            // applied yet, so `pixel_count` can still be as large as 65535 * 65535, which
+            // times four does not fit a 32-bit usize.
+            if entry.pixels.len() / 4 < pixel_count {
                 return Err(invalid_field_err!(
                     "glyphIndex",
-                    "cached glyph area does not match destination",
+                    "cached glyph smaller than destination area",
                     in: src
                 ));
             }
-            return Ok(entry.pixels.clone());
+            return Ok(entry.pixels[..pixel_count * 4].to_vec());
         }
 
         // Cap allocation to prevent OOM from adversarial dimensions.
@@ -667,6 +668,34 @@ mod tests {
 
         let pixels2 = decoder.decode(&hit_stream, 1, 1).unwrap();
         assert_eq!(pixels1, pixels2);
+    }
+
+    #[test]
+    fn glyph_hit_allows_smaller_or_equal_area() {
+        // FreeRDP validates the pixel count, not the shape: a 2x2 glyph may be
+        // hit as 4x1 (equal area) or 2x1 (prefix), but not as 4x4.
+        let mut decoder = ClearCodecDecoder::new();
+
+        let mut stream = Vec::new();
+        stream.push(FLAG_GLYPH_INDEX);
+        stream.push(0x00);
+        stream.extend_from_slice(&7u16.to_le_bytes());
+        let residual = [0xFF, 0xFF, 0xFF, 0x04]; // white, run=4
+        stream.extend_from_slice(&4u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&residual);
+        let stored = decoder.decode(&stream, 2, 2).unwrap();
+        assert_eq!(stored.len(), 4 * 4);
+
+        let hit = |seq: u8| {
+            let mut hit = vec![FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT, seq];
+            hit.extend_from_slice(&7u16.to_le_bytes());
+            hit
+        };
+        assert_eq!(decoder.decode(&hit(1), 4, 1).unwrap(), stored);
+        assert_eq!(decoder.decode(&hit(2), 2, 1).unwrap(), stored[..8]);
+        assert!(decoder.decode(&hit(3), 4, 4).is_err());
     }
 
     #[test]

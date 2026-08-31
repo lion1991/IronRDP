@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use ironrdp_core::{decode, encode_vec};
+use ironrdp_pdu::gcc::ChannelOptions;
 use ironrdp_rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler};
 use ironrdp_rdpsnd::pdu::{self, AudioFormat, PitchPdu, VolumePdu, WaveFormat};
 use ironrdp_svc::SvcProcessor as _;
@@ -115,6 +116,20 @@ fn encoded_wave_data(remaining: &[u8]) -> Vec<u8> {
 fn encoded_wave() -> Vec<u8> {
     // WaveInfo for a 4-byte sample (prefix only; remaining audio empty).
     encoded_wave_info(4)
+}
+
+// ============================================================================
+// Channel definition
+// ============================================================================
+
+#[test]
+fn channel_options_advertise_initialized_and_encrypt_rdp() {
+    // Windows audio redirection does not bind to a channel declared with empty options.
+    let client = Rdpsnd::new(Box::new(NoopRdpsndBackend));
+    assert_eq!(
+        client.channel_options(),
+        ChannelOptions::INITIALIZED | ChannelOptions::ENCRYPT_RDP
+    );
 }
 
 // ============================================================================

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use ironrdp_core::{Decode as _, Encode as _, EncodeResult, ReadCursor, cast_length, impl_as_any};
 use ironrdp_pdu::gcc::ChannelName;
+use ironrdp_pdu::gcc::ChannelOptions;
 use ironrdp_pdu::{PduResult, encode_err, pdu_other_err};
 use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
 use tracing::{debug, error, warn};
@@ -259,6 +260,12 @@ impl SvcProcessor for Rdpsnd {
 
     fn compression_condition(&self) -> CompressionCondition {
         CompressionCondition::Never
+    }
+
+    /// Match mstsc/FreeRDP: Windows audio redirection does not bind to a channel
+    /// declared with empty options.
+    fn channel_options(&self) -> ChannelOptions {
+        ChannelOptions::INITIALIZED | ChannelOptions::ENCRYPT_RDP
     }
 
     fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {

@@ -12,10 +12,6 @@ const MAX_ZERO_RUN: usize = 4096;
 /// Errors encountered while decoding or encoding an SRL stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrlError {
-    /// The required trailing zero byte is absent.
-    MissingTerminator,
-    /// The stream ended before a complete code word was read.
-    Truncated,
     /// An SRL value requires between one and fifteen magnitude bits.
     InvalidBitCount(u8),
     /// A value cannot be represented by the magnitude width.
@@ -27,8 +23,6 @@ pub enum SrlError {
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::MissingTerminator => write!(f, "srl stream is missing its trailing zero byte"),
-            Self::Truncated => write!(f, "srl stream is truncated"),
             Self::InvalidBitCount(bits) => write!(f, "invalid srl magnitude bit count {bits}"),
             Self::MagnitudeOutOfRange { magnitude, max } => {
                 write!(f, "srl magnitude {magnitude} exceeds maximum {max}")
@@ -39,6 +33,13 @@ impl core::fmt::Display for SrlError {
 }
 
 impl core::error::Error for SrlError {}
+
+/// One zero-run code word: a bare `0` bit (`Chunk`) or a `1` bit plus k-bit tail
+/// that precedes a non-zero value (`Tail`).
+enum ZeroRun {
+    Chunk(usize),
+    Tail(usize),
+}
 
 /// Stateful decoder for one component's SRL stream.
 ///
@@ -52,18 +53,14 @@ pub struct SrlDecoder<'a> {
 }
 
 impl<'a> SrlDecoder<'a> {
-    /// Create a decoder for an SRL stream, excluding its required trailing zero byte.
+    /// Create a decoder for an SRL stream.
+    ///
+    /// Windows encoders do not always append a trailing zero byte and may stop the
+    /// bit stream as soon as the last non-zero code word ends; like FreeRDP, bits past
+    /// the end of `data` read as zero, so the stream is never rejected for being short.
     pub fn new(data: &'a [u8]) -> Result<Self, SrlError> {
-        let Some((&terminator, payload)) = data.split_last() else {
-            return Err(SrlError::MissingTerminator);
-        };
-
-        if terminator != 0 {
-            return Err(SrlError::MissingTerminator);
-        }
-
         Ok(Self {
-            reader: BitReader::new(payload),
+            reader: BitReader::new(data),
             kp: INITIAL_KP,
             zero_run_remaining: 0,
             nonzero_pending: false,
@@ -90,44 +87,44 @@ impl<'a> SrlDecoder<'a> {
                 continue;
             }
 
-            self.zero_run_remaining = self.decode_zero_run()?;
-            self.nonzero_pending = true;
+            match self.decode_zero_run()? {
+                ZeroRun::Chunk(zeros) => self.zero_run_remaining = zeros,
+                ZeroRun::Tail(zeros) => {
+                    self.zero_run_remaining = zeros;
+                    self.nonzero_pending = true;
+                }
+            }
         }
 
         Ok(output)
     }
 
-    fn decode_zero_run(&mut self) -> Result<usize, SrlError> {
-        let mut zeros = 0usize;
+    /// Read one zero-run code word, mirroring FreeRDP `progressive_rfx_srl_read`.
+    ///
+    /// A `0` bit stands for exactly `1 << k` zeros and is consumed on its own; the
+    /// next code word is only read once those zeros are used up. This keeps a stream
+    /// that ends early (bits past the end read as zero) producing zeros on demand
+    /// instead of accumulating an unbounded run.
+    fn decode_zero_run(&mut self) -> Result<ZeroRun, SrlError> {
+        let k = self.kp / 8;
 
-        loop {
-            let k = self.kp / 8;
-
-            if self.reader.read_bit()? {
-                let tail = usize::try_from(self.reader.read_bits(k)?).map_err(|_| SrlError::ZeroRunTooLong)?;
-                self.kp = self.kp.saturating_sub(6);
-
-                let zeros = zeros.checked_add(tail).ok_or(SrlError::ZeroRunTooLong)?;
-                return (zeros <= MAX_ZERO_RUN).then_some(zeros).ok_or(SrlError::ZeroRunTooLong);
-            }
-
-            let chunk = 1usize << k;
-            zeros = zeros.checked_add(chunk).ok_or(SrlError::ZeroRunTooLong)?;
-            if zeros > MAX_ZERO_RUN {
-                return Err(SrlError::ZeroRunTooLong);
-            }
-
-            self.kp = self.kp.saturating_add(4).min(MAX_KP);
+        if self.reader.read_bit() {
+            let tail = usize::try_from(self.reader.read_bits(k)).map_err(|_| SrlError::ZeroRunTooLong)?;
+            self.kp = self.kp.saturating_sub(6);
+            return Ok(ZeroRun::Tail(tail));
         }
+
+        self.kp = self.kp.saturating_add(4).min(MAX_KP);
+        Ok(ZeroRun::Chunk(1usize << k))
     }
 
     fn decode_nonzero(&mut self, num_bits: u8) -> Result<i16, SrlError> {
         let maximum = max_magnitude(num_bits)?;
-        let sign = self.reader.read_bit()?;
+        let sign = self.reader.read_bit();
         let mut zero_count = 0u16;
 
         while zero_count + 1 < maximum {
-            if self.reader.read_bit()? {
+            if self.reader.read_bit() {
                 break;
             }
 
@@ -276,9 +273,10 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn read_bit(&mut self) -> Result<bool, SrlError> {
+    /// Bits past the end of the stream read as zero (see [`SrlDecoder::new`]).
+    fn read_bit(&mut self) -> bool {
         let Some(&byte) = self.data.get(self.byte_idx) else {
-            return Err(SrlError::Truncated);
+            return false;
         };
 
         let bit = (byte >> (7 - self.bit_idx)) & 1 != 0;
@@ -288,15 +286,15 @@ impl<'a> BitReader<'a> {
             self.byte_idx += 1;
         }
 
-        Ok(bit)
+        bit
     }
 
-    fn read_bits(&mut self, count: u8) -> Result<u32, SrlError> {
+    fn read_bits(&mut self, count: u8) -> u32 {
         let mut value = 0u32;
         for _ in 0..count {
-            value = (value << 1) | u32::from(self.read_bit()?);
+            value = (value << 1) | u32::from(self.read_bit());
         }
-        Ok(value)
+        value
     }
 }
 
@@ -368,13 +366,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_stream() {
-        assert_eq!(decode_srl(&[0x80, 0x00], 1, 4), Err(SrlError::Truncated));
+    fn truncated_stream_reads_as_zero_padding() {
+        // Bits past the end read as zero, exactly like an explicitly zero-padded stream.
+        let short = decode_srl(&[0x80, 0x00], 1, 4);
+        assert!(short.is_ok());
+        assert_eq!(short, decode_srl(&[0x80, 0x00, 0x00, 0x00], 1, 4));
     }
 
     #[test]
-    fn rejects_missing_terminator() {
-        assert_eq!(decode_srl(&[0x84], 1, 4), Err(SrlError::MissingTerminator));
+    fn stream_without_terminator_decodes() {
+        // Windows omits the trailing zero byte; it must decode like the terminated form.
+        let unterminated = decode_srl(&[0x84], 1, 4);
+        assert!(unterminated.is_ok());
+        assert_eq!(unterminated, decode_srl(&[0x84, 0x00], 1, 4));
     }
 
     #[test]

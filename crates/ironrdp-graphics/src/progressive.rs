@@ -2082,26 +2082,27 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_pass_rejects_truncated_srl() {
-        let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
-        let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
-        sign[0] = SIGN_ZERO;
-
-        let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
-        prev_prog_quant.hl1 = 4;
-
-        assert_eq!(
+    fn upgrade_pass_zero_pads_truncated_srl() {
+        // A short SRL stream decodes like the same stream padded with zero bytes.
+        let run = |srl: &[u8]| {
+            let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
+            sign[0] = SIGN_ZERO;
+            let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
+            prev_prog_quant.hl1 = 4;
             decode_upgrade_pass(
-                &[0x80, 0x00],
+                srl,
                 &[],
                 &prev_prog_quant,
                 &ComponentCodecQuant::LOSSLESS,
                 false,
                 &mut coefficients,
                 &mut sign,
-            ),
-            Err(SrlError::Truncated)
-        );
+            )
+            .unwrap();
+            (coefficients, sign)
+        };
+        assert_eq!(run(&[0x80, 0x00]), run(&[0x80, 0x00, 0x00, 0x00]));
     }
 
     #[test]
@@ -2115,9 +2116,11 @@ mod tests {
         tile.sign[0][0] = SIGN_ZERO;
         tile.sign[1][0] = SIGN_ZERO;
 
+        // Component 1 asks for a 20-bit refinement, which SRL cannot represent.
+        tile.prog_quant[1].hl1 = 20;
+        let prev_prog_quant = tile.prog_quant;
         let coefficients = tile.coefficients;
         let sign = tile.sign;
-
         assert_eq!(
             tile.decode_upgrade(
                 [&[0x90, 0x00], &[0x80, 0x00], &[]],
@@ -2125,12 +2128,12 @@ mod tests {
                 [ComponentCodecQuant::LOSSLESS; 3],
                 75,
             ),
-            Err(SrlError::Truncated)
+            Err(SrlError::InvalidBitCount(20))
         );
 
         assert_eq!(tile.coefficients, coefficients);
         assert_eq!(tile.sign, sign);
-        assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
+        assert_eq!(tile.prog_quant, prev_prog_quant);
         assert_eq!(tile.pass, 1);
         assert_eq!(tile.quality, 50);
     }

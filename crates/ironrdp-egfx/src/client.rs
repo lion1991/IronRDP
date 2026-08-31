@@ -423,6 +423,10 @@ pub struct GraphicsPipelineClient {
 
     surfaces: BTreeMap<u16, Surface>,
     compositor: Compositor,
+    /// When false, WireToSurface2 is not decoded in-library and no surface command
+    /// reaches `compositor`; embedders with their own pipeline consume the handler
+    /// callbacks instead. See [`Self::with_builtin_compositing`].
+    builtin_compositing: bool,
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
@@ -449,10 +453,26 @@ impl GraphicsPipelineClient {
             codec_caps: CodecCapabilities::default(),
             surfaces: BTreeMap::new(),
             compositor: Compositor::default(),
+            builtin_compositing: true,
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
         }
+    }
+
+    /// Enable or disable the built-in Progressive decode and compositor (default: on).
+    ///
+    /// With `false`, `WireToSurface2` is only forwarded through
+    /// [`GraphicsPipelineHandler::on_wire_to_surface2`] (no in-library decode, no
+    /// `on_bitmap_updated` for its tiles), no surface command is applied to the
+    /// compositor, and [`Self::drain_output`] stays empty. AVC420 / ClearCodec /
+    /// Planar / Uncompressed are still decoded and delivered via `on_bitmap_updated`.
+    /// For embedders that run their own decoder and compositor and would otherwise
+    /// decode and paint everything twice.
+    #[must_use]
+    pub fn with_builtin_compositing(mut self, enabled: bool) -> Self {
+        self.builtin_compositing = enabled;
+        self
     }
 
     // ========================================================================
@@ -498,6 +518,9 @@ impl GraphicsPipelineClient {
     /// ready to blit into a framebuffer. Each call empties the queue.
     #[must_use]
     pub fn drain_output(&mut self) -> Vec<OutputUpdate> {
+        if !self.builtin_compositing {
+            return Vec::new();
+        }
         self.compositor.drain_output()
     }
 
@@ -549,8 +572,10 @@ impl GraphicsPipelineClient {
             // Surface operations
             GfxPdu::SolidFill(pdu) => {
                 trace!(surface_id = pdu.surface_id, "SolidFill");
-                self.compositor
-                    .solid_fill(pdu.surface_id, &pdu.fill_pixel, &pdu.rectangles);
+                if self.builtin_compositing {
+                    self.compositor
+                        .solid_fill(pdu.surface_id, &pdu.fill_pixel, &pdu.rectangles);
+                }
                 self.handler.on_solid_fill(&pdu);
                 Ok(vec![])
             }
@@ -560,12 +585,14 @@ impl GraphicsPipelineClient {
                     dst = pdu.destination_surface_id,
                     "SurfaceToSurface"
                 );
-                self.compositor.surface_to_surface(
-                    pdu.source_surface_id,
-                    pdu.destination_surface_id,
-                    &pdu.source_rectangle,
-                    &pdu.destination_points,
-                );
+                if self.builtin_compositing {
+                    self.compositor.surface_to_surface(
+                        pdu.source_surface_id,
+                        pdu.destination_surface_id,
+                        &pdu.source_rectangle,
+                        &pdu.destination_points,
+                    );
+                }
                 self.handler.on_surface_to_surface(&pdu);
                 Ok(vec![])
             }
@@ -577,8 +604,10 @@ impl GraphicsPipelineClient {
                     cache_slot = pdu.cache_slot,
                     "SurfaceToCache"
                 );
-                self.compositor
-                    .surface_to_cache(pdu.surface_id, pdu.cache_slot, &pdu.source_rectangle);
+                if self.builtin_compositing {
+                    self.compositor
+                        .surface_to_cache(pdu.surface_id, pdu.cache_slot, &pdu.source_rectangle);
+                }
                 self.handler.on_surface_to_cache(&pdu);
                 Ok(vec![])
             }
@@ -588,14 +617,18 @@ impl GraphicsPipelineClient {
                     surface_id = pdu.surface_id,
                     "CacheToSurface"
                 );
-                self.compositor
-                    .cache_to_surface(pdu.cache_slot, pdu.surface_id, &pdu.destination_points);
+                if self.builtin_compositing {
+                    self.compositor
+                        .cache_to_surface(pdu.cache_slot, pdu.surface_id, &pdu.destination_points);
+                }
                 self.handler.on_cache_to_surface(&pdu);
                 Ok(vec![])
             }
             GfxPdu::EvictCacheEntry(pdu) => {
                 trace!(cache_slot = pdu.cache_slot, "EvictCacheEntry");
-                self.compositor.evict_cache_entry(pdu.cache_slot);
+                if self.builtin_compositing {
+                    self.compositor.evict_cache_entry(pdu.cache_slot);
+                }
                 self.handler.on_evict_cache_entry(&pdu);
                 Ok(vec![])
             }
@@ -687,7 +720,9 @@ impl GraphicsPipelineClient {
     fn handle_reset_graphics(&mut self, width: u32, height: u32) {
         // Per spec, ResetGraphics implicitly destroys all surfaces
         self.surfaces.clear();
-        self.compositor.reset(width, height);
+        if self.builtin_compositing {
+            self.compositor.reset(width, height);
+        }
 
         // Reset frame tracking state so subsequent FrameAcknowledge PDUs
         // don't report stale queue depth from a previous stream.
@@ -734,7 +769,9 @@ impl GraphicsPipelineClient {
         };
 
         debug!(surface_id, width, height, ?pixel_format, "Surface created");
-        self.compositor.create_surface(surface_id, width, height);
+        if self.builtin_compositing {
+            self.compositor.create_surface(surface_id, width, height);
+        }
         self.handler.on_surface_created(&surface);
         self.surfaces.insert(surface_id, surface);
     }
@@ -742,7 +779,9 @@ impl GraphicsPipelineClient {
     fn handle_delete_surface(&mut self, surface_id: u16) {
         self.progressive_decoder.delete_surface(surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
-            self.compositor.delete_surface(surface_id);
+            if self.builtin_compositing {
+                self.compositor.delete_surface(surface_id);
+            }
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
         } else {
@@ -755,7 +794,9 @@ impl GraphicsPipelineClient {
             surface.is_mapped = true;
             surface.output_origin_x = origin_x;
             surface.output_origin_y = origin_y;
-            self.compositor.map_surface(surface_id, origin_x, origin_y);
+            if self.builtin_compositing {
+                self.compositor.map_surface(surface_id, origin_x, origin_y);
+            }
             debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
             self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
         } else {
@@ -768,13 +809,15 @@ impl GraphicsPipelineClient {
             surface.is_mapped = true;
             surface.output_origin_x = pdu.output_origin_x;
             surface.output_origin_y = pdu.output_origin_y;
-            self.compositor.map_surface_scaled(
-                pdu.surface_id,
-                pdu.output_origin_x,
-                pdu.output_origin_y,
-                pdu.target_width,
-                pdu.target_height,
-            );
+            if self.builtin_compositing {
+                self.compositor.map_surface_scaled(
+                    pdu.surface_id,
+                    pdu.output_origin_x,
+                    pdu.output_origin_y,
+                    pdu.target_width,
+                    pdu.target_height,
+                );
+            }
             debug!(
                 surface_id = pdu.surface_id,
                 origin_x = pdu.output_origin_x,
@@ -855,6 +898,10 @@ impl GraphicsPipelineClient {
     /// Decode RemoteFX Progressive bitmap data, applying each decoded tile to the
     /// persistent surface before delivering the same RGBA update to the handler.
     fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
+        if !self.builtin_compositing {
+            // The handler already received the PDU in `handle_pdu` and decodes it itself.
+            return Ok(());
+        }
         let surface = self
             .surfaces
             .get(&pdu.surface_id)
@@ -901,8 +948,10 @@ impl GraphicsPipelineClient {
                     width,
                     height,
                 };
-                self.compositor
-                    .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+                if self.builtin_compositing {
+                    self.compositor
+                        .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+                }
                 self.handler.on_bitmap_updated(&update);
             };
 
@@ -1002,8 +1051,10 @@ impl GraphicsPipelineClient {
                 width: w,
                 height: h,
             };
-            self.compositor
-                .apply_bitmap(surface_id, &update.destination_rectangle, &update.data);
+            if self.builtin_compositing {
+                self.compositor
+                    .apply_bitmap(surface_id, &update.destination_rectangle, &update.data);
+            }
             self.handler.on_bitmap_updated(&update);
         }
         Ok(())
@@ -1037,7 +1088,9 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        if self.builtin_compositing {
+            self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        }
         self.handler.on_bitmap_updated(&update);
         Ok(())
     }
@@ -1083,7 +1136,9 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        if self.builtin_compositing {
+            self.compositor.apply_bitmap(surface_id, dest_rect, &update.data);
+        }
         self.handler.on_bitmap_updated(&update);
         Ok(())
     }
@@ -1108,8 +1163,10 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
-        self.compositor
-            .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+        if self.builtin_compositing {
+            self.compositor
+                .apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
+        }
         self.handler.on_bitmap_updated(&update);
     }
 
@@ -1122,7 +1179,9 @@ impl GraphicsPipelineClient {
         self.progressive_decoder.end_frame();
 
         // Commit the frame's compositor deltas so `drain_output` can surface them.
-        self.compositor.end_frame();
+        if self.builtin_compositing {
+            self.compositor.end_frame();
+        }
 
         self.handler.on_frame_complete(frame_id);
 
@@ -2342,6 +2401,103 @@ mod tests {
         wire_progressive(&mut client, shared_bitmap_data).unwrap();
         end_frame(&mut client, 3);
         assert!(client.drain_output().is_empty());
+    }
+
+    struct ForwardingHandler {
+        wire_to_surface2: Arc<Mutex<usize>>,
+        solid_fills: Arc<Mutex<usize>>,
+        bitmaps: Arc<Mutex<usize>>,
+    }
+    impl GraphicsPipelineHandler for ForwardingHandler {
+        fn on_capabilities_confirmed(&mut self, _caps: &CapabilitySet) {}
+        fn on_reset_graphics(&mut self, _width: u32, _height: u32) {}
+        fn on_surface_created(&mut self, _surface: &Surface) {}
+        fn on_surface_deleted(&mut self, _surface_id: u16) {}
+        fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
+        fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {
+            *self.bitmaps.lock().unwrap() += 1;
+        }
+        fn on_frame_complete(&mut self, _frame_id: u32) {}
+        fn on_close(&mut self) {}
+        fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+        fn on_solid_fill(&mut self, _pdu: &SolidFillPdu) {
+            *self.solid_fills.lock().unwrap() += 1;
+        }
+        fn on_wire_to_surface2(&mut self, _pdu: &WireToSurface2Pdu) {
+            *self.wire_to_surface2.lock().unwrap() += 1;
+        }
+    }
+
+    /// Drive a mapped surface through SolidFill + WireToSurface2 in one frame and
+    /// return `(drain_output len, wire_to_surface2, solid_fills, bitmaps)`.
+    fn run_frame_with_builtin_compositing(enabled: bool) -> (usize, usize, usize, usize) {
+        let wire_to_surface2 = Arc::new(Mutex::new(0));
+        let solid_fills = Arc::new(Mutex::new(0));
+        let bitmaps = Arc::new(Mutex::new(0));
+        let handler = ForwardingHandler {
+            wire_to_surface2: Arc::clone(&wire_to_surface2),
+            solid_fills: Arc::clone(&solid_fills),
+            bitmaps: Arc::clone(&bitmaps),
+        };
+        let mut client = GraphicsPipelineClient::new(Box::new(handler), None).with_builtin_compositing(enabled);
+        client
+            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 64,
+                height: 64,
+                monitors: vec![],
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 64,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }))
+            .unwrap();
+        start_frame(&mut client, 1);
+        client
+            .handle_pdu(GfxPdu::SolidFill(SolidFillPdu {
+                surface_id: 1,
+                fill_pixel: crate::pdu::Color {
+                    b: 1,
+                    g: 2,
+                    r: 3,
+                    xa: 0xFF,
+                },
+                rectangles: vec![ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 8,
+                    bottom: 8,
+                }],
+            }))
+            .unwrap();
+        wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
+        end_frame(&mut client, 1);
+        let output = client.drain_output().len();
+        let count = |c: &Arc<Mutex<usize>>| *c.lock().unwrap();
+        (output, count(&wire_to_surface2), count(&solid_fills), count(&bitmaps))
+    }
+
+    #[test]
+    fn builtin_compositing_disabled_forwards_pdus_without_decoding_or_output() {
+        assert_eq!(run_frame_with_builtin_compositing(false), (0, 1, 1, 0));
+    }
+
+    #[test]
+    fn builtin_compositing_enabled_keeps_upstream_behaviour() {
+        // The test stream carries no tiles, so no bitmap callback either way.
+        let (output, wire_to_surface2, solid_fills, bitmaps) = run_frame_with_builtin_compositing(true);
+        assert!(output > 0);
+        assert_eq!((wire_to_surface2, solid_fills, bitmaps), (1, 1, 0));
     }
 
     fn assert_progressive_context_is_deleted(clear: impl FnOnce(&mut GraphicsPipelineClient)) {

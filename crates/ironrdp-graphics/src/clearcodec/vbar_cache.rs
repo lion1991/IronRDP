@@ -95,6 +95,16 @@ impl VBarCache {
         index
     }
 
+    /// Current full-V-bar write cursor (server-lockstep invariant checks).
+    pub fn vbar_cursor(&self) -> u16 {
+        self.vbar_cursor
+    }
+
+    /// Current short-V-bar write cursor (server-lockstep invariant checks).
+    pub fn short_vbar_cursor(&self) -> u16 {
+        self.short_vbar_cursor
+    }
+
     /// Reconstruct a full V-bar from a short V-bar and background color.
     ///
     /// The full V-bar has:

@@ -155,7 +155,7 @@ fn decode_first_pass_to_dwtq(
 /// - `raw_data`: raw bit stream for non-zero-DAS positions
 /// - `prev_prog_quant`: BitPos values from previous quality level
 /// - `curr_prog_quant`: BitPos values for this quality level
-/// - `use_reduce_extrapolate`: whether to use asymmetric band sizes
+/// - `use_reduce_extrapolate`: unused; the bit stream always uses the reduce-extrapolate band order
 /// - `coefficients`: coefficient buffer to accumulate into (modified in-place)
 /// - `sign`: DAS sign buffer (modified in-place when zeros become non-zero)
 ///
@@ -172,14 +172,14 @@ pub fn decode_upgrade_pass(
     raw_data: &[u8],
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
-    use_reduce_extrapolate: bool,
+    _use_reduce_extrapolate: bool,
     coefficients: &mut [i16],
     sign: &mut [i8],
 ) -> Result<(), SrlError> {
     assert!(coefficients.len() >= COEFFICIENTS_PER_COMPONENT);
     assert!(sign.len() >= COEFFICIENTS_PER_COMPONENT);
 
-    let bands = get_band_layout(use_reduce_extrapolate);
+    let bands = upgrade_band_layout();
     let zero_counts: [usize; NUM_BANDS] = core::array::from_fn(|band_idx| band_zero_count(sign, &bands[band_idx]));
     let has_srl_values = bands.iter().enumerate().any(|(band_idx, _)| {
         let num_bits = prev_prog_quant
@@ -462,9 +462,9 @@ pub fn encode_upgrade_pass(
     prev_prog_quant: &ComponentCodecQuant,
     curr_prog_quant: &ComponentCodecQuant,
     sign: &[i8],
-    use_reduce_extrapolate: bool,
+    _use_reduce_extrapolate: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), SrlError> {
-    let bands = get_band_layout(use_reduce_extrapolate);
+    let bands = upgrade_band_layout();
     let mut srl_encoder = srl::SrlEncoder::new();
     let mut has_srl_values = false;
     let mut raw_writer = RawBitWriter::new();
@@ -638,6 +638,12 @@ fn standard_band_layout() -> [BandInfo; NUM_BANDS] {
         b(8, 8),   // HH3: 64
         b(8, 8),   // LL3: 64
     ]
+}
+
+/// FreeRDP walks the UPGRADE SRL/raw bit streams in reduce-extrapolate band
+/// order regardless of which IDWT the tile finally uses (LH1 starts at 1023).
+fn upgrade_band_layout() -> [BandInfo; NUM_BANDS] {
+    crate::dwt_extrapolate::band_layout()
 }
 
 /// Starting offset of the LL3 subband for delta decoding.
@@ -2872,6 +2878,24 @@ mod tests {
 
         assert!(srl_data.is_empty(), "no refinement bits, SRL should be empty");
         assert!(raw_data.is_empty(), "no refinement bits, raw should be empty");
+    }
+
+    #[test]
+    fn upgrade_pass_uses_freerdp_band_order_even_without_extrapolate_dwt() {
+        let mut coefficients = vec![0i16; COEFFICIENTS_PER_COMPONENT];
+        let mut sign = vec![SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
+        let prev_prog = ComponentCodecQuant {
+            lh1: 1,
+            ..ComponentCodecQuant::LOSSLESS
+        };
+        let curr_prog = ComponentCodecQuant::LOSSLESS;
+
+        // Only LH1 refines by one raw bit; no zero DAS so no SRL stream.
+        decode_upgrade_pass(&[], &[0x80], &prev_prog, &curr_prog, false, &mut coefficients, &mut sign).unwrap();
+
+        // Extrapolate layout: HL1 is 31x33 = 1023, so LH1 starts at 1023, not 1024.
+        assert_eq!(coefficients[1023], 1);
+        assert_eq!(coefficients[1024], 0);
     }
 
     // --- B12: Integration / round-trip tests ---

@@ -462,7 +462,6 @@ impl ChunkProcessor {
         let mut chunks = Vec::new();
 
         let total_len = encoded_pdu.filled_len();
-        let is_chunked = total_len > max_chunk_len;
         let mut chunk_start_index: usize = 0;
         let mut chunk_end_index = core::cmp::min(total_len, max_chunk_len);
         loop {
@@ -485,10 +484,11 @@ impl ChunkProcessor {
                 if last {
                     flags |= ChannelFlags::LAST;
                 }
-                if is_chunked {
-                    flags |= ChannelFlags::SHOW_PROTOCOL;
-                }
-
+                // CHANNEL_FLAG_SHOW_PROTOCOL is only valid for channels opened with
+                // CHANNEL_OPTION_SHOW_PROTOCOL; setting it on ordinary chunked
+                // messages makes Windows hand the channel header to the channel
+                // application (RDPDR reads then desync with "device not connected").
+                // Processors that need it pass it through `message.flags`.
                 flags |= message.flags;
 
                 ChannelPduHeader {

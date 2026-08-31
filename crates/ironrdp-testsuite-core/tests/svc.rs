@@ -244,14 +244,16 @@ fn static_channel_rejects_malformed_chunk_sequences() {
 }
 
 #[test]
-fn static_channel_chunks_show_protocol_header() {
+fn static_channel_chunks_do_not_add_show_protocol() {
+    // CHANNEL_FLAG_SHOW_PROTOCOL belongs to channels opened with CHANNEL_OPTION_SHOW_PROTOCOL
+    // only; chunking must not add it (Windows RDPDR desyncs on large read responses otherwise).
     let chunks = StaticVirtualChannel::chunkify(vec![SvcMessage::from(vec![0; CHANNEL_CHUNK_LENGTH + 1])])
         .expect("static channel message should chunk");
 
     assert_eq!(chunks.len(), 2);
     for chunk in chunks {
         let header = decode::<ChannelPduHeader>(chunk.filled()).expect("channel header should decode");
-        assert!(header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
+        assert!(!header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
     }
 }
 
@@ -303,21 +305,15 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
     assert_eq!(first.0.initiator_id, 1002);
     assert_eq!(first_header.length, 4097);
     assert_eq!(first.0.user_data.len() - 8, 4096);
-    assert!(
-        first_header
-            .flags
-            .contains(ChannelControlFlags::FLAG_FIRST | ChannelControlFlags::FLAG_SHOW_PROTOCOL)
-    );
+    assert!(first_header.flags.contains(ChannelControlFlags::FLAG_FIRST));
+    assert!(!first_header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
     assert!(!first_header.flags.contains(ChannelControlFlags::FLAG_LAST));
 
     let second_header = decode::<ChannelPduHeader>(second.0.user_data.as_ref()).expect("second header should decode");
     assert_eq!(second_header.length, 4097);
     assert_eq!(second.0.user_data.len() - 8, 1);
-    assert!(
-        second_header
-            .flags
-            .contains(ChannelControlFlags::FLAG_LAST | ChannelControlFlags::FLAG_SHOW_PROTOCOL)
-    );
+    assert!(second_header.flags.contains(ChannelControlFlags::FLAG_LAST));
+    assert!(!second_header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
     assert!(!second_header.flags.contains(ChannelControlFlags::FLAG_FIRST));
 
     let shutdown = active_stage

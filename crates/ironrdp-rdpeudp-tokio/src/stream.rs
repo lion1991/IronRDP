@@ -127,6 +127,12 @@ impl SharedIo {
     }
 }
 
+/// The driver keeps only the error's kind; name it so a caller can tell a
+/// socket failure from an aborted driver.
+fn transport_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, format!("RDPEUDP2 transport error ({kind})"))
+}
+
 // ════════════════════════════════════════════════════════════════════
 // RdpeudpStream
 // ════════════════════════════════════════════════════════════════════
@@ -167,7 +173,7 @@ impl AsyncRead for RdpeudpStream {
         }
 
         if let Some(kind) = shared.error {
-            return Poll::Ready(Err(io::Error::new(kind, "RDPEUDP2 transport error")));
+            return Poll::Ready(Err(transport_error(kind)));
         }
 
         if shared.closed {
@@ -189,7 +195,7 @@ impl AsyncWrite for RdpeudpStream {
             .map_err(|_| io::Error::other("shared lock poisoned"))?;
 
         if let Some(kind) = shared.error {
-            return Poll::Ready(Err(io::Error::new(kind, "RDPEUDP2 transport error")));
+            return Poll::Ready(Err(transport_error(kind)));
         }
 
         if shared.closed {
@@ -221,7 +227,7 @@ impl AsyncWrite for RdpeudpStream {
             .map_err(|_| io::Error::other("shared lock poisoned"))?;
 
         if let Some(kind) = shared.error {
-            return Poll::Ready(Err(io::Error::new(kind, "RDPEUDP2 transport error")));
+            return Poll::Ready(Err(transport_error(kind)));
         }
 
         if shared.write_buf.is_empty() {

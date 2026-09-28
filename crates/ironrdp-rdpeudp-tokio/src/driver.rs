@@ -90,6 +90,9 @@ impl Driver {
     /// Run the driver event loop until the connection closes or errors.
     pub(crate) async fn run(mut self) -> Result<(), DriverError> {
         let result = self.run_to_completion().await;
+        if let Err(error) = &result {
+            tracing::warn!(error = %error.report(), "RDPEUDP driver stopped");
+        }
 
         // However this ended, the stream side has to hear about it. A reader
         // parked in `poll_read` has left its waker here and nothing else will
@@ -148,7 +151,17 @@ impl Driver {
 
                 // Branch 1: Incoming UDP datagram (highest priority)
                 result = self.socket.recv(&mut self.recv_buf), if has_room => {
-                    let n = result.map_err(|error| DriverError::socket("receive datagram", error))?;
+                    let n = match result {
+                        Ok(n) => n,
+                        // The socket is connected, so an ICMP error for an
+                        // earlier send surfaces on the next recv. The path
+                        // may recover; a dead one closes on the idle timer.
+                        Err(error) if is_transient_recv_error(&error) => {
+                            tracing::debug!(%error, "ignoring a transient receive error");
+                            continue;
+                        }
+                        Err(error) => return Err(DriverError::socket("receive datagram", error)),
+                    };
                     let now = self.clock.now();
 
                     // handle_datagram takes &mut [u8] for in-place prefix byte swap
@@ -258,10 +271,12 @@ impl Driver {
                 pad_handshake_datagram(transmit.contents)
             };
 
-            self.socket
-                .send(&bytes)
-                .await
-                .map_err(|error| DriverError::socket("send datagram", error))?;
+            // A datagram the OS will not send is lost like any other: data
+            // retransmits on RTO, an ACK is superseded by the next one. macOS
+            // returns ENOBUFS when an interface queue (a VPN utun) is full.
+            if let Err(error) = self.socket.send(&bytes).await {
+                tracing::debug!(%error, len = bytes.len(), "dropping a datagram the socket would not send");
+            }
         }
         Ok(())
     }
@@ -343,6 +358,7 @@ impl Drop for Driver {
             return;
         }
 
+        tracing::warn!("RDPEUDP driver dropped before releasing the stream");
         if let Ok(mut shared) = self.shared.lock() {
             shared.error.get_or_insert(io::ErrorKind::ConnectionAborted);
             shared.close();
@@ -469,6 +485,17 @@ fn is_droppable(error: &RdpeudpError) -> bool {
             | RdpeudpErrorKind::Prefix(_)
             | RdpeudpErrorKind::InvalidPacket { .. }
             | RdpeudpErrorKind::InvalidState
+    )
+}
+
+/// Receive errors that report on the path rather than on the socket itself.
+fn is_transient_recv_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
     )
 }
 
@@ -622,6 +649,29 @@ mod tests {
     fn droppable_errors_are_the_ones_the_peer_controls() {
         assert!(is_droppable(&RdpeudpError::invalid_packet("test", "malformed")));
         assert!(!is_droppable(&RdpeudpError::connection_closed("test")));
+    }
+
+    #[test]
+    fn icmp_reported_receive_errors_are_transient() {
+        assert!(is_transient_recv_error(&io::ErrorKind::ConnectionRefused.into()));
+        assert!(is_transient_recv_error(&io::ErrorKind::HostUnreachable.into()));
+        assert!(!is_transient_recv_error(&io::ErrorKind::InvalidInput.into()));
+    }
+
+    /// A failed send is a lost datagram, not a dead connection.
+    #[tokio::test]
+    async fn a_send_error_does_not_stop_the_driver() {
+        // Unconnected, so every `send` fails.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let conn = RdpeudpConnection::connect(test_connection_config(), Clock::new().now()).expect("connect");
+        let mut driver = Driver::new(
+            socket,
+            conn,
+            Arc::new(Mutex::new(SharedIo::new())),
+            Arc::new(Notify::new()),
+        );
+
+        driver.drain_transmits().await.expect("a send error is not fatal");
     }
 
     /// A driver that exits on an error has to release the stream side. A

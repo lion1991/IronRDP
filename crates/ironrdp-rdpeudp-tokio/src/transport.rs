@@ -278,6 +278,16 @@ impl UdpTransport {
     /// once the send channel is dropped, below. Then waits for all
     /// three background tasks to complete.
     pub async fn shutdown(mut self) -> Result<(), UdpTransportError> {
+        // A driver that already failed is the root cause; the pumps only saw
+        // its fallout.
+        if let Some(driver) = self.driver_handle.take_if_finished() {
+            if let Ok(Err(error)) = driver.await {
+                if !matches!(error.kind(), DriverErrorKind::ConnectionClosed) {
+                    return Err(UdpTransportError::driver("shutdown", error));
+                }
+            }
+        }
+
         // Drop the send channel to signal the write pump to stop
         drop(self.data_tx);
         drop(self.data_rx);

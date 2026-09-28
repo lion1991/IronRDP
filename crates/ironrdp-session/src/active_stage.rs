@@ -542,7 +542,8 @@ impl ActiveStage {
         Ok(())
     }
 
-    /// Returns whether Soft-Sync moved any DVC to the reliable UDP tunnel.
+    /// Returns whether Soft-Sync routed any DVC ID to the reliable UDP tunnel, including IDs
+    /// the server may still open there.
     pub fn reliable_udp_dvc_tunnel_in_use(&self) -> bool {
         self.x224_processor
             .get_svc_processor::<DrdynvcClient>()

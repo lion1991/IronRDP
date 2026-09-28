@@ -277,7 +277,10 @@ fn config_supports_pcm(range: &SupportedStreamConfigRange, format: &AudioFormat)
     let Some(sample_format) = pcm_sample_format(format.bits_per_sample) else {
         return false;
     };
-    if range.sample_format() != sample_format {
+    // cpal's CoreAudio host lists every range as F32, yet its output AudioUnit
+    // converts integer PCM; comparing formats there would filter out every PCM
+    // candidate and leave the server no common format (no audio at all).
+    if range.sample_format() != sample_format && !cfg!(target_os = "macos") {
         return false;
     }
     if range.channels() < format.n_channels {
@@ -647,5 +650,49 @@ impl RxBuffer {
             }
             fill_silence(&mut data[filled..], self.bits_per_sample);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cpal::SupportedBufferSize;
+
+    use super::*;
+
+    fn pcm_44k_stereo() -> AudioFormat {
+        AudioFormat {
+            format: WaveFormat::PCM,
+            n_channels: 2,
+            n_samples_per_sec: 44100,
+            n_avg_bytes_per_sec: 176400,
+            n_block_align: 4,
+            bits_per_sample: 16,
+            data: None,
+        }
+    }
+
+    fn range(channels: u16, min: u32, max: u32, sample_format: SampleFormat) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(channels, min, max, SupportedBufferSize::Unknown, sample_format)
+    }
+
+    #[test]
+    fn pcm_needs_enough_channels_and_a_rate_in_range() {
+        let format = pcm_44k_stereo();
+        assert!(config_supports_pcm(&range(2, 44100, 96000, SampleFormat::I16), &format));
+        assert!(!config_supports_pcm(
+            &range(1, 44100, 96000, SampleFormat::I16),
+            &format
+        ));
+        assert!(!config_supports_pcm(
+            &range(2, 48000, 96000, SampleFormat::I16),
+            &format
+        ));
+    }
+
+    /// What cpal reports for built-in MacBook speakers.
+    #[test]
+    fn pcm_on_a_float_range_is_supported_only_on_macos() {
+        let supported = config_supports_pcm(&range(2, 44100, 96000, SampleFormat::F32), &pcm_44k_stereo());
+        assert_eq!(supported, cfg!(target_os = "macos"));
     }
 }

@@ -2280,11 +2280,11 @@ impl RdpeudpConnection {
     /// (MS-RDPEUDP 3.1.5.1.2): `snSourceAck` is the highest Source sequence
     /// number seen and the vector runs down from it.
     ///
-    /// The vector has to reach down to the lowest missing packet (2.2.2.6):
-    /// ACKs are cumulative (3.1.1.4), so a hole left below the vector reads as
-    /// received and is never resent, and in-order delivery stalls on it for
-    /// good. Should the vector not fit, it keeps the oldest runs and lowers
-    /// `snSourceAck` instead; the newer ones are reported by later ACKs.
+    /// The vector runs all the way down to the sender's last AckOfAcks
+    /// (2.2.2.6): Windows takes only the packets a vector names, so one left
+    /// out is never acknowledged, whether received or a hole. Should the
+    /// vector not fit, it keeps the oldest runs and lowers `snSourceAck`
+    /// instead; the newer ones are reported by later ACKs.
     fn build_v1_ack_parts(&self, flags: V1Flags) -> Option<(FecHeader, V1AckVectorHeader)> {
         let params = self.params.as_ref()?;
         let recv_window = self.recv_window.as_ref()?;
@@ -2376,7 +2376,12 @@ impl RdpeudpConnection {
 
     fn finish_v1_acknowledgement(&mut self) {
         self.v1_stats.acks_sent += 1;
-        self.commit_acknowledgement();
+        // Unlike MS-RDPEUDP2, sending the ACK releases nothing: Windows takes
+        // only the packets a vector names as acknowledged, so a received packet
+        // stays in every vector until the sender's AckOfAcks covers it. Losing
+        // the one ACK that named it otherwise leaves the sender retransmitting
+        // it to no avail until it drops the connection.
+        self.ack_delay_started_at = None;
         self.ack_pending = false;
         self.timers.clear(Timer::AckDelay);
         self.v1_ack_delayed = false;
@@ -3099,6 +3104,75 @@ mod v1_tests {
         let datagram: V1Datagram = decode(&ack.contents).unwrap();
         assert_eq!(datagram.header.sn_source_ack, REMOTE_ISN + 1);
         assert!(datagram.ack_vector.unwrap().elements[0].state.is_received());
+    }
+
+    /// Windows takes only the packets a vector names. Captured over a lossy
+    /// tunnel: the one ACK naming a packet was lost, later ACKs started above
+    /// it, and the server resent it three times before resetting the
+    /// connection. A received packet has to stay in the vector until the
+    /// sender's AckOfAcks covers it.
+    #[test]
+    fn a_received_packet_stays_in_the_vector_until_the_ack_of_acks() {
+        let mut conn = established(2);
+        for offset in 1..=3 {
+            let mut wire = server_datagram(LOCAL_ISN, &[(true, 1)], Some((REMOTE_ISN + offset, b"x")));
+            conn.handle_datagram(&mut wire, at(40)).unwrap();
+            // Each ACK goes out (and is lost) before the next packet arrives.
+            conn.handle_timeout(at(400));
+            while conn.poll_transmit(at(400)).is_some() {}
+        }
+
+        let mut resent = server_datagram(LOCAL_ISN, &[(true, 1)], Some((REMOTE_ISN + 1, b"x")));
+        conn.handle_datagram(&mut resent, at(500)).unwrap();
+        conn.handle_timeout(at(900));
+        let ack = conn.poll_transmit(at(900)).expect("ACK");
+        let datagram: V1Datagram = decode(&ack.contents).unwrap();
+        assert_eq!(datagram.header.sn_source_ack, REMOTE_ISN + 3);
+        let covered: u32 = datagram
+            .ack_vector
+            .unwrap()
+            .elements
+            .iter()
+            .map(|e| u32::from(e.length) + 1)
+            .sum();
+        assert_eq!(covered, 3, "still names REMOTE_ISN + 1");
+
+        // The server has seen our ACKs up to +2; the next vector starts above.
+        let mut with_ack_of_acks = encode_vec(&V1Datagram {
+            header: FecHeader {
+                sn_source_ack: LOCAL_ISN,
+                receive_window_size: 64,
+                flags: V1Flags::empty(),
+            },
+            ack_vector: Some(V1AckVectorHeader {
+                elements: vec![V1AckVectorElement {
+                    state: VectorElementState::DatagramReceived,
+                    length: 0,
+                }],
+            }),
+            ack_of_acks: Some(V1AckOfAcksHeader {
+                reset_seq_num: REMOTE_ISN + 2,
+            }),
+            syn_data: None,
+            correlation_id: None,
+            syn_data_ex: None,
+            data: Some(SourceData {
+                header: SourcePayloadHeader {
+                    sn_coded: REMOTE_ISN + 4,
+                    sn_source_start: REMOTE_ISN + 4,
+                },
+                payload: b"x".to_vec(),
+            }),
+        })
+        .unwrap();
+        conn.handle_datagram(&mut with_ack_of_acks, at(1_000)).unwrap();
+        conn.handle_timeout(at(1_400));
+        let ack = conn.poll_transmit(at(1_400)).expect("ACK");
+        let datagram: V1Datagram = decode(&ack.contents).unwrap();
+        assert_eq!(datagram.header.sn_source_ack, REMOTE_ISN + 4);
+        let elements = datagram.ack_vector.unwrap().elements;
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].length, 1, "+3 and +4");
     }
 
     /// A packet declared lost waits outside the send window for its

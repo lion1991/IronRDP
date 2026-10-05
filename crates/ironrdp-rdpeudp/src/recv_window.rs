@@ -137,6 +137,8 @@ impl RecvWindow {
     /// Mark a slot received, returning whether this is new rather than a
     /// duplicate or a packet outside the window.
     fn occupy_slot(&mut self, data_seq: u64, channel_seq: Option<u64>) -> bool {
+        self.trim_acknowledged_history();
+
         // Ignore packets below the window base (already processed).
         if data_seq < self.base_seq {
             return false;
@@ -144,8 +146,11 @@ impl RecvWindow {
 
         let index = data_seq - self.base_seq;
 
-        // Ignore packets beyond the window limit.
-        if index >= u64::try_from(self.max_entries).expect("max_entries fits in u64") {
+        // Ignore packets beyond the window limit. The window starts at the
+        // lowest missing slot: received slots below it may still be awaiting
+        // the sender's AckOfAcks, and must not shrink the window meanwhile.
+        let limit = self.leading_received() + self.max_entries;
+        if index >= u64::try_from(limit).expect("window limit fits in u64") {
             return false;
         }
 
@@ -210,18 +215,35 @@ impl RecvWindow {
     ///
     /// Returns the number of slots released.
     pub(crate) fn release_acknowledged(&mut self) -> usize {
-        let received = self
-            .entries
+        let received = self.leading_received();
+        self.release(received);
+        received
+    }
+
+    /// Received slots at the bottom of the window, before the lowest hole.
+    fn leading_received(&self) -> usize {
+        self.entries
             .iter()
             .take_while(|entry| entry.state == RecvEntryState::Received)
-            .count();
+            .count()
+    }
 
-        if received > 0 {
-            self.entries.drain(..received);
-            self.base_seq += u64::try_from(received).expect("run length fits in u64");
+    /// Keep at most one window of received slots below the lowest hole.
+    ///
+    /// MS-RDPEUDP keeps reporting a received packet until the sender's
+    /// AckOfAcks covers it, but a sender that sends none (or loses them)
+    /// must not grow the window without bound. Past one window of history
+    /// the oldest slots are released as if acknowledged.
+    fn trim_acknowledged_history(&mut self) {
+        let excess = self.leading_received().saturating_sub(self.max_entries);
+        self.release(excess);
+    }
+
+    fn release(&mut self, count: usize) {
+        if count > 0 {
+            self.entries.drain(..count);
+            self.base_seq += u64::try_from(count).expect("run length fits in u64");
         }
-
-        received
     }
 
     /// Advance the window base up to `new_base`.
@@ -601,5 +623,29 @@ mod tests {
         }
         let delivered = w.drain_ordered();
         assert_eq!(delivered.len(), 5); // 105, 106, 107, 108, 109
+    }
+
+    /// Received slots kept for the ACK vector until an AckOfAcks do not
+    /// count against the window, and are themselves capped at one window.
+    #[test]
+    fn unreleased_history_neither_shrinks_the_window_nor_grows_without_bound() {
+        let window = 16u64;
+        let mut w = RecvWindow::new(1, 1, 4);
+        for seq in 1..=window {
+            assert!(w.receive(seq, seq, vec![0]));
+            w.drain_ordered();
+        }
+        assert_eq!(w.base_seq(), 1, "nothing released without an AckOfAcks");
+        assert!(
+            w.receive(2 * window, 2 * window, vec![0]),
+            "a full window above the history"
+        );
+
+        for seq in window + 1..4 * window {
+            w.receive(seq, seq, vec![0]);
+            w.drain_ordered();
+        }
+        let span = w.highest_seq() - w.base_seq() + 1;
+        assert!(span <= 2 * window, "history capped at one window, span {span}");
     }
 }

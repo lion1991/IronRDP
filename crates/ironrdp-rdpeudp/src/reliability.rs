@@ -71,6 +71,11 @@ impl ReliabilityController {
         !self.queue.is_empty()
     }
 
+    /// The lowest ChannelSeqNum waiting to be retransmitted.
+    pub(crate) fn lowest_channel_seq(&self) -> Option<u64> {
+        self.queue.iter().map(|e| e.channel_seq).min()
+    }
+
     /// Number of entries in the queue.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

@@ -208,13 +208,25 @@ const HANDSHAKE_RETRANSMIT_LIMIT: u8 = 5;
 /// any of it drains.
 const SEND_BUFFER_WINDOW_MULTIPLE: usize = 8;
 
-/// Bytes reserved in a version 1/2 Source Packet for the FEC header (8), an ACK
-/// vector of up to [`V1_ACK_VECTOR_MAX_ELEMENTS`] elements with its size field and
-/// DWORD padding (36), an optional ACK-of-ACKs header (4) and the source payload
-/// header (8).
-const V1_DATA_OVERHEAD: usize = 8 + 36 + 4 + 8;
-/// Elements kept in an outgoing version 1/2 ACK vector; the oldest runs are dropped.
-const V1_ACK_VECTOR_MAX_ELEMENTS: usize = 32;
+/// Bytes a version 1/2 Source Packet spends besides its payload and ACK vector:
+/// the FEC header (8), an optional ACK-of-ACKs header (4) and the source payload
+/// header (8). See [`v1_data_overhead`].
+const V1_DATA_FIXED_OVERHEAD: usize = 8 + 4 + 8;
+/// Upper bound on the elements of an outgoing version 1/2 ACK vector.
+const V1_ACK_VECTOR_MAX_ELEMENTS: usize = 256;
+
+/// Elements an outgoing version 1/2 ACK vector may carry. A run covers at least
+/// one receive window slot, so one element per slot is the worst case and a
+/// window of up to [`V1_ACK_VECTOR_MAX_ELEMENTS`] slots is never truncated.
+fn v1_ack_vector_capacity(log_window_size: u8) -> usize {
+    (1usize << log_window_size).min(V1_ACK_VECTOR_MAX_ELEMENTS)
+}
+
+/// Bytes reserved in a version 1/2 Source Packet for everything but its payload,
+/// including a full ACK vector with its size field and DWORD padding.
+fn v1_data_overhead(log_window_size: u8) -> usize {
+    V1_DATA_FIXED_OVERHEAD + (2 + v1_ack_vector_capacity(log_window_size)).next_multiple_of(4)
+}
 /// MS-RDPEUDP 2.2.2.6: an ACK-of-ACKs SHOULD follow every 20 datagrams.
 const V1_ACK_OF_ACKS_INTERVAL: u32 = 20;
 
@@ -684,7 +696,9 @@ impl RdpeudpConnection {
     /// [`send`]: Self::send
     pub fn max_payload(&self) -> usize {
         if let Some(params) = self.params.as_ref().filter(|p| matches!(p.wire, WireFormat::V1 { .. })) {
-            return usize::from(params.mtu).saturating_sub(V1_DATA_OVERHEAD).max(1);
+            return usize::from(params.mtu)
+                .saturating_sub(v1_data_overhead(params.log_window_size))
+                .max(1);
         }
 
         let mtu = self
@@ -2245,15 +2259,16 @@ impl RdpeudpConnection {
         let reference = recv_window.highest_seq();
         let source_seq = seq::reconstruct_seq32(data.header.sn_source_start, reference);
 
-        if !recv_window.receive(source_seq, source_seq, data.payload) {
-            return;
-        }
-        self.v1_stats.data_in += 1;
-
-        for chunk in recv_window.drain_ordered() {
-            self.pending_events.push_back(Event::DataReceived(chunk));
+        if recv_window.receive(source_seq, source_seq, data.payload) {
+            self.v1_stats.data_in += 1;
+            for chunk in recv_window.drain_ordered() {
+                self.pending_events.push_back(Event::DataReceived(chunk));
+            }
         }
 
+        // 3.1.1.4: every Source Packet is acknowledged, duplicates included. A
+        // duplicate means our ACK for it was lost, and a sender stalled on it
+        // would otherwise hear nothing until the keep-alive.
         self.ack_pending = true;
         if !self.timers.is_set(Timer::AckDelay) {
             self.timers.set(Timer::AckDelay, now + self.ack_delay_timeout());
@@ -2264,15 +2279,25 @@ impl RdpeudpConnection {
     /// The `RDPUDP_FEC_HEADER` and ACK vector describing what we have received
     /// (MS-RDPEUDP 3.1.5.1.2): `snSourceAck` is the highest Source sequence
     /// number seen and the vector runs down from it.
+    ///
+    /// The vector has to reach down to the lowest missing packet (2.2.2.6):
+    /// ACKs are cumulative (3.1.1.4), so a hole left below the vector reads as
+    /// received and is never resent, and in-order delivery stalls on it for
+    /// good. Should the vector not fit, it keeps the oldest runs and lowers
+    /// `snSourceAck` instead; the newer ones are reported by later ACKs.
     fn build_v1_ack_parts(&self, flags: V1Flags) -> Option<(FecHeader, V1AckVectorHeader)> {
         let params = self.params.as_ref()?;
         let recv_window = self.recv_window.as_ref()?;
+        let capacity = v1_ack_vector_capacity(params.log_window_size);
 
         let mut elements: Vec<V1AckVectorElement> = Vec::new();
-        'runs: for (received, count) in recv_window.ack_vector().into_iter().rev() {
+        let mut covered: u64 = 0;
+        let mut truncated = false;
+        'runs: for (received, count) in recv_window.ack_vector() {
             let mut remaining = count;
             while remaining > 0 {
-                if elements.len() >= V1_ACK_VECTOR_MAX_ELEMENTS {
+                if elements.len() >= capacity {
+                    truncated = true;
                     break 'runs;
                 }
                 let chunk = u8::try_from(remaining.min(u64::from(V1AckVectorElement::MAX_LENGTH) + 1))
@@ -2287,8 +2312,22 @@ impl RdpeudpConnection {
                     length: chunk - 1,
                 });
                 remaining -= u64::from(chunk);
+                covered += u64::from(chunk);
             }
         }
+        // Built oldest first; the wire runs down from `snSourceAck`.
+        elements.reverse();
+        // The window's top slot is always a received one, so a truncated
+        // vector may end on a hole; drop it to keep `snSourceAck` received.
+        while truncated && elements.first().is_some_and(|e| !e.state.is_received()) {
+            let dropped = elements.remove(0);
+            covered -= u64::from(dropped.length) + 1;
+        }
+        let sn_source_ack = if truncated && covered > 0 {
+            recv_window.base_seq() + covered - 1
+        } else {
+            recv_window.highest_seq()
+        };
         if elements.is_empty() {
             // Nothing since the handshake: acknowledge the SYN+ACK's own sequence number.
             elements.push(V1AckVectorElement {
@@ -2303,7 +2342,7 @@ impl RdpeudpConnection {
         }
 
         let header = FecHeader {
-            sn_source_ack: seq::truncate_seq32(recv_window.highest_seq()),
+            sn_source_ack: seq::truncate_seq32(sn_source_ack),
             receive_window_size: 1u16 << u16::from(params.log_window_size),
             flags,
         };
@@ -2320,9 +2359,13 @@ impl RdpeudpConnection {
         }
         self.v1_since_ack_of_acks = 0;
         let send_window = self.send_window.as_ref()?;
+        // A packet declared lost leaves the send window until it is resent, but
+        // it is still unacknowledged: claiming it would let the peer advance
+        // its window past the retransmission and drop it.
         let cumulative = send_window
             .pending_entries()
             .map(|entry| entry.channel_seq)
+            .chain(self.reliability.lowest_channel_seq())
             .min()
             .unwrap_or_else(|| send_window.next_channel_seq())
             .saturating_sub(1);
@@ -2713,7 +2756,10 @@ mod v1_tests {
         let conn = established(2);
         assert_eq!(conn.params.as_ref().unwrap().wire, WireFormat::V1 { version: 2 });
         assert!(conn.effective_rto() >= Duration::from_millis(300));
-        assert_eq!(conn.max_payload(), 1232 - V1_DATA_OVERHEAD);
+        assert_eq!(
+            conn.max_payload(),
+            1232 - v1_data_overhead(ConnectionConfig::default().log_window_size)
+        );
     }
 
     #[test]
@@ -2981,6 +3027,101 @@ mod v1_tests {
         assert_eq!(elements[0].length, 0, "one datagram");
         assert!(!elements[1].state.is_received());
         assert_eq!(elements[1].length, 1, "two datagrams");
+    }
+
+    /// Every other Source Packet of the receive window, leaving a hole below
+    /// each: one run per slot, the worst case for the ACK vector.
+    fn receive_alternate_slots(conn: &mut RdpeudpConnection) -> u32 {
+        let window = 1u32 << conn.params.as_ref().unwrap().log_window_size;
+        for offset in (2..=window).step_by(2) {
+            let mut wire = server_datagram(LOCAL_ISN, &[(true, 1)], Some((REMOTE_ISN + offset, b"x")));
+            conn.handle_datagram(&mut wire, at(40)).unwrap();
+        }
+        window
+    }
+
+    /// ACKs are cumulative, so a vector that stops above the lowest hole
+    /// gives up every hole below it: they are never resent and in-order
+    /// delivery stalls on the first of them.
+    #[test]
+    fn the_ack_vector_reaches_the_lowest_hole_however_many_lie_above_it() {
+        let mut conn = established(2);
+        let window = receive_alternate_slots(&mut conn);
+
+        conn.handle_timeout(at(400));
+        let ack = conn.poll_transmit(at(400)).expect("ACK");
+        let datagram: V1Datagram = decode(&ack.contents).unwrap();
+        assert_eq!(datagram.header.sn_source_ack, REMOTE_ISN + window);
+        let elements = datagram.ack_vector.unwrap().elements;
+        assert_eq!(elements.len(), usize::try_from(window).unwrap());
+        let covered: u32 = elements.iter().map(|e| u32::from(e.length) + 1).sum();
+        assert_eq!(covered, window, "runs down to REMOTE_ISN + 1");
+        assert!(!elements.last().unwrap().state.is_received(), "the lowest hole");
+    }
+
+    /// The payload limit leaves room for that worst-case vector.
+    #[test]
+    fn a_full_source_packet_with_the_worst_ack_vector_fits_the_mtu() {
+        let mut conn = established(2);
+        receive_alternate_slots(&mut conn);
+
+        let mtu = usize::from(conn.params.as_ref().unwrap().mtu);
+        conn.send(vec![0xAB; conn.max_payload()]).unwrap();
+        let mut sent_data = false;
+        while let Some(out) = conn.poll_transmit(at(41)) {
+            assert!(
+                out.contents.len() <= mtu,
+                "{} bytes over an MTU of {mtu}",
+                out.contents.len()
+            );
+            sent_data |= decode::<V1Datagram>(&out.contents).unwrap().data.is_some();
+        }
+        assert!(sent_data);
+    }
+
+    /// The server resends a Source Packet whose ACK was lost; staying silent
+    /// leaves it retransmitting until it gives up on the connection.
+    #[test]
+    fn a_duplicate_source_packet_is_acknowledged_again() {
+        let mut conn = established(2);
+        let mut first = server_datagram(LOCAL_ISN, &[(true, 1)], Some((REMOTE_ISN + 1, b"a")));
+        conn.handle_datagram(&mut first, at(40)).unwrap();
+        assert_eq!(conn.poll_event(), Some(Event::DataReceived(b"a".to_vec())));
+        conn.handle_timeout(at(400));
+        assert!(conn.poll_transmit(at(400)).is_some(), "first ACK");
+        assert!(conn.poll_transmit(at(400)).is_none());
+
+        let mut again = server_datagram(LOCAL_ISN, &[(true, 1)], Some((REMOTE_ISN + 1, b"a")));
+        conn.handle_datagram(&mut again, at(500)).unwrap();
+        assert_eq!(conn.poll_event(), None, "delivered once");
+        conn.handle_timeout(at(900));
+        let ack = conn.poll_transmit(at(900)).expect("the duplicate is acknowledged");
+        let datagram: V1Datagram = decode(&ack.contents).unwrap();
+        assert_eq!(datagram.header.sn_source_ack, REMOTE_ISN + 1);
+        assert!(datagram.ack_vector.unwrap().elements[0].state.is_received());
+    }
+
+    /// A packet declared lost waits outside the send window for its
+    /// retransmission; the ACK-of-ACKs must not claim it.
+    #[test]
+    fn a_packet_awaiting_retransmission_holds_back_the_ack_of_acks() {
+        let mut conn = established(2);
+        conn.send(b"a".to_vec()).unwrap();
+        conn.send(b"b".to_vec()).unwrap();
+        while conn.poll_transmit(at(30)).is_some() {}
+        let first = conn
+            .send_window
+            .as_ref()
+            .unwrap()
+            .pending_entries()
+            .find(|e| e.channel_seq == u64::from(LOCAL_ISN) + 1)
+            .expect("first packet in flight")
+            .data_seq;
+        conn.declare_lost(first);
+
+        conn.v1_since_ack_of_acks = V1_ACK_OF_ACKS_INTERVAL - 1;
+        let ack_of_acks = conn.take_v1_ack_of_acks().expect("due");
+        assert_eq!(ack_of_acks.reset_seq_num, LOCAL_ISN, "LOCAL_ISN + 1 is unacknowledged");
     }
 
     #[test]

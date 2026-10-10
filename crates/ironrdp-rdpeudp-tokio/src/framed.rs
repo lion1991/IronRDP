@@ -67,14 +67,15 @@ impl FramedWrite for UdpTransport {
 
 #[cfg(test)]
 mod tests {
+    use ironrdp_rdpemt::TunnelData;
     use tokio::sync::mpsc;
 
     use super::*;
 
     /// Build a `UdpTransport` backed by test channels (no real network).
-    fn test_transport() -> (UdpTransport, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    fn test_transport() -> (UdpTransport, mpsc::Sender<Vec<u8>>, mpsc::Receiver<TunnelData>) {
         let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(16);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<TunnelData>(16);
 
         let transport = UdpTransport::from_channels(incoming_rx, outgoing_tx);
 
@@ -149,8 +150,9 @@ mod tests {
             .await
             .unwrap();
 
-        let data = receiver.recv().await.unwrap();
-        assert_eq!(data, vec![0x01, 0x02, 0x03]);
+        let pdu = receiver.recv().await.unwrap();
+        assert!(pdu.sub_headers.is_empty());
+        assert_eq!(pdu.higher_layer_data, vec![0x01, 0x02, 0x03]);
     }
 
     #[tokio::test]

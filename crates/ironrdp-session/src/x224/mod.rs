@@ -1,9 +1,14 @@
+use std::time::Instant;
+
 use ironrdp_bulk::BulkCompressor;
 use ironrdp_core::{Decode as _, ReadCursor, WriteBuf, decode};
 use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DynamicChannelMut, DynamicChannelRef};
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
 use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage, SendDataIndicationCtx};
-use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
+use ironrdp_pdu::rdp::autodetect::{
+    AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONTINUOUS,
+    BW_START_RELIABLE_UDP, BW_STOP_RELIABLE_UDP,
+};
 use ironrdp_pdu::rdp::client_info::CompressionType;
 use ironrdp_pdu::rdp::headers::{
     BasicSecurityHeader, BasicSecurityHeaderFlags, CompressionFlags, IoChannelPdu, ShareDataCtx, ShareDataPdu,
@@ -107,6 +112,20 @@ pub struct Processor {
     io_channel_id: u16,
     message_channel_id: Option<u16>,
     share_id: u32,
+    /// Open continuous bandwidth measurement window on the main connection
+    /// ([MS-RDPBCGR] 2.2.14.1.2 / 2.2.14.1.4, requestType 0x0014 / 0x0429).
+    bw_measure: Option<BwMeasureWindow>,
+}
+
+/// Bytes received on the main connection since a continuous Bandwidth
+/// Measure Start. After the connection sequence every server-to-client PDU
+/// stands in for the connect-time payload messages ([MS-RDPBCGR] 2.2.14.2.2),
+/// so the count must cover all inbound frames, not just the message channel;
+/// the owner feeds it through [`Processor::note_received_bytes`].
+#[derive(Debug, Clone, Copy)]
+struct BwMeasureWindow {
+    started_at: Instant,
+    bytes: u64,
 }
 
 impl Processor {
@@ -123,6 +142,17 @@ impl Processor {
             io_channel_id,
             message_channel_id,
             share_id,
+            bw_measure: None,
+        }
+    }
+
+    /// Account for a frame received from the server on the main connection.
+    ///
+    /// Only matters while a continuous bandwidth measurement window is open;
+    /// the total is reported in the Bandwidth Measure Results reply.
+    pub fn note_received_bytes(&mut self, len: usize) {
+        if let Some(window) = self.bw_measure.as_mut() {
+            window.bytes = window.bytes.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         }
     }
 
@@ -445,6 +475,20 @@ impl Processor {
         Ok(decompressed)
     }
 
+    /// Wrap an auto-detect response in the `SEC_AUTODETECT_RSP` header and an MCS
+    /// Send Data Request on the message channel.
+    fn encode_autodetect_response(
+        &self,
+        message_channel_id: u16,
+        response: AutoDetectResponse,
+    ) -> SessionResult<Vec<u8>> {
+        let response = AutoDetectRspPdu::new(response);
+        let mut frame = WriteBuf::new();
+        ironrdp_pdu::mcs::encode_send_data_request(self.user_channel_id, message_channel_id, &response, &mut frame)
+            .map_err(SessionError::encode)?;
+        Ok(frame.into_inner())
+    }
+
     /// Process a PDU received on the MCS message channel: auto-detect
     /// ([MS-RDPBCGR] 2.2.14), multitransport ([MS-RDPBCGR] 2.2.15), or
     /// Heartbeat ([MS-RDPBCGR] 2.2.16.1).
@@ -457,7 +501,7 @@ impl Processor {
     /// session-fatal decode error: this channel is forward-safe for future
     /// message-channel PDU types the same way the connect-time demux
     /// (`ironrdp-connector`) already is.
-    fn process_message_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+    fn process_message_channel(&mut self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
         let Some(message_channel_id) = self.message_channel_id else {
             return Err(reason_err!("message channel", "no message channel negotiated"));
         };
@@ -497,17 +541,56 @@ impl Processor {
 
         match req.request {
             AutoDetectRequest::RttRequest { sequence_number, .. } => {
-                let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
-                let mut frame = WriteBuf::new();
-                ironrdp_pdu::mcs::encode_send_data_request(
-                    self.user_channel_id,
+                let frame = self.encode_autodetect_response(
                     message_channel_id,
-                    &response,
-                    &mut frame,
-                )
-                .map_err(SessionError::encode)?;
+                    AutoDetectResponse::RttResponse { sequence_number },
+                )?;
                 debug!(sequence_number, "Responded to auto-detect RTT request");
-                Ok(vec![ProcessorOutput::ResponseFrame(frame.into_inner())])
+                Ok(vec![ProcessorOutput::ResponseFrame(frame)])
+            }
+            // Continuous bandwidth measurement on the main connection: open the
+            // window; every frame the owner reports from now on counts.
+            AutoDetectRequest::BandwidthMeasureStart {
+                sequence_number,
+                request_type,
+            } if request_type == BW_START_RELIABLE_UDP => {
+                self.bw_measure = Some(BwMeasureWindow {
+                    started_at: Instant::now(),
+                    bytes: 0,
+                });
+                debug!(sequence_number, "Continuous bandwidth measurement started");
+                Ok(Vec::new())
+            }
+            // Close the window and report it ([MS-RDPBCGR] 2.2.14.2.2, responseType
+            // 0x000B). A Stop with no open window has nothing truthful to report; a
+            // zero byte count would read as a dead link, so it is dropped instead.
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                request_type,
+                ..
+            } if request_type == BW_STOP_RELIABLE_UDP => {
+                let Some(window) = self.bw_measure.take() else {
+                    debug!(sequence_number, "Bandwidth Measure Stop without a Start, ignoring");
+                    return Ok(Vec::new());
+                };
+                let time_delta_ms = u32::try_from(window.started_at.elapsed().as_millis())
+                    .unwrap_or(u32::MAX)
+                    .max(1);
+                let byte_count = u32::try_from(window.bytes).unwrap_or(u32::MAX);
+                let frame = self.encode_autodetect_response(
+                    message_channel_id,
+                    AutoDetectResponse::BandwidthMeasureResults {
+                        sequence_number,
+                        response_type: BW_RESULTS_CONTINUOUS,
+                        time_delta_ms,
+                        byte_count,
+                    },
+                )?;
+                debug!(
+                    sequence_number,
+                    time_delta_ms, byte_count, "Responded to continuous bandwidth measurement"
+                );
+                Ok(vec![ProcessorOutput::ResponseFrame(frame)])
             }
             req @ AutoDetectRequest::NetworkCharacteristicsResult { .. } => {
                 debug!(?req, "Received network characteristics from server");
@@ -638,7 +721,7 @@ mod tests {
     fn processor_surfaces_multitransport_request_on_message_channel() {
         let request = multitransport_request();
         let encoded = encode_vec(&request).expect("encode multitransport request");
-        let processor = Processor::new(StaticChannelSet::new(), 1002, 1003, Some(1004), 0);
+        let mut processor = Processor::new(StaticChannelSet::new(), 1002, 1003, Some(1004), 0);
 
         let outputs = processor
             .process_message_channel(SendDataIndicationCtx {
@@ -652,6 +735,95 @@ mod tests {
             outputs.as_slice(),
             [ProcessorOutput::MultitransportRequest(decoded)] if decoded == &request
         ));
+    }
+
+    fn autodetect_request_frame(request: AutoDetectRequest) -> Vec<u8> {
+        encode_vec(&AutoDetectReqPdu::new(request)).expect("encode auto-detect request")
+    }
+
+    fn feed_message_channel(processor: &mut Processor, user_data: &[u8]) -> Vec<ProcessorOutput> {
+        processor
+            .process_message_channel(SendDataIndicationCtx {
+                initiator_id: 1002,
+                channel_id: 1004,
+                user_data,
+            })
+            .expect("process message channel PDU")
+    }
+
+    fn decode_autodetect_response(output: &ProcessorOutput) -> AutoDetectResponse {
+        let ProcessorOutput::ResponseFrame(frame) = output else {
+            panic!("expected a response frame");
+        };
+        let X224(McsMessage::SendDataRequest(request)) =
+            decode::<X224<McsMessage<'_>>>(frame).expect("decode MCS Send Data Request")
+        else {
+            panic!("expected MCS Send Data Request");
+        };
+        assert_eq!(request.channel_id, 1004);
+        decode::<AutoDetectRspPdu>(&request.user_data)
+            .expect("decode auto-detect response")
+            .response
+    }
+
+    #[test]
+    fn processor_reports_continuous_bandwidth_measurement() {
+        let mut processor = Processor::new(StaticChannelSet::new(), 1002, 1003, Some(1004), 0);
+
+        // Bytes before Start must not count.
+        processor.note_received_bytes(5000);
+        let outputs = feed_message_channel(
+            &mut processor,
+            &autodetect_request_frame(AutoDetectRequest::bw_start_continuous(7)),
+        );
+        assert!(outputs.is_empty(), "Start warrants no reply");
+
+        processor.note_received_bytes(1000);
+        processor.note_received_bytes(234);
+        let outputs = feed_message_channel(
+            &mut processor,
+            &autodetect_request_frame(AutoDetectRequest::bw_stop_continuous(8)),
+        );
+        let [output] = outputs.as_slice() else {
+            panic!("expected exactly one response frame, got {}", outputs.len());
+        };
+        let AutoDetectResponse::BandwidthMeasureResults {
+            sequence_number,
+            response_type,
+            time_delta_ms,
+            byte_count,
+        } = decode_autodetect_response(output)
+        else {
+            panic!("expected Bandwidth Measure Results");
+        };
+        assert_eq!(sequence_number, 8);
+        assert_eq!(response_type, BW_RESULTS_CONTINUOUS);
+        assert_eq!(byte_count, 1234);
+        assert!(time_delta_ms >= 1);
+
+        // Window is closed: later bytes and a second Stop report nothing.
+        processor.note_received_bytes(99);
+        let outputs = feed_message_channel(
+            &mut processor,
+            &autodetect_request_frame(AutoDetectRequest::bw_stop_continuous(9)),
+        );
+        assert!(outputs.is_empty(), "Stop without Start is dropped");
+    }
+
+    #[test]
+    fn processor_still_answers_rtt_requests() {
+        let mut processor = Processor::new(StaticChannelSet::new(), 1002, 1003, Some(1004), 0);
+        let outputs = feed_message_channel(
+            &mut processor,
+            &autodetect_request_frame(AutoDetectRequest::rtt_continuous(3)),
+        );
+        let [output] = outputs.as_slice() else {
+            panic!("expected one RTT response");
+        };
+        assert_eq!(
+            decode_autodetect_response(output),
+            AutoDetectResponse::RttResponse { sequence_number: 3 }
+        );
     }
 
     #[test]

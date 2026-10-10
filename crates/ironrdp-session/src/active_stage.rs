@@ -190,6 +190,9 @@ impl ActiveStage {
         frame: &[u8],
     ) -> SessionResult<Vec<ActiveStageOutput>> {
         self.damage_regions.clear();
+        // Every inbound frame counts toward an open continuous bandwidth
+        // measurement, fast-path included ([MS-RDPBCGR] 2.2.14.2.2).
+        self.x224_processor.note_received_bytes(frame.len());
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
                 let mut output = WriteBuf::new();

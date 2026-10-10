@@ -10,9 +10,11 @@
 
 use std::io;
 
-use ironrdp_rdpemt::{RdpemtTunnel, TunnelEvent};
+use ironrdp_rdpemt::{RdpemtTunnel, TunnelData, TunnelEvent};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::sync::mpsc;
 
+use crate::autodetect::TunnelAutoDetect;
 use crate::error::{UdpTransportError, UdpTransportErrorExt as _};
 
 /// Read a complete RDPEMT PDU from the stream using self-framing.
@@ -114,15 +116,21 @@ where
 /// This runs in the same task as the data forwarding loop after the
 /// tunnel is established. It reads tunnel PDUs, processes them through
 /// the sans-I/O state machine, and sends `TunnelEvent::Data` payloads
-/// to the application.
+/// to the application. Auto-detect requests riding the sub-headers
+/// (continuous RTT / bandwidth measurement, [MS-RDPBCGR] 2.2.14) are
+/// answered here, through `outgoing_tx`, in a Tunnel Data PDU with an
+/// empty payload.
 pub(crate) async fn tunnel_data_loop<S>(
     stream: &mut S,
     tunnel: &mut RdpemtTunnel,
-    data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_tx: &mpsc::Sender<Vec<u8>>,
+    outgoing_tx: &mpsc::Sender<TunnelData>,
 ) -> Result<(), UdpTransportError>
 where
     S: AsyncRead + Unpin,
 {
+    let mut autodetect = TunnelAutoDetect::default();
+
     loop {
         let pdu = match read_tunnel_pdu(stream).await {
             Ok(Some(pdu)) => pdu,
@@ -130,6 +138,7 @@ where
             Ok(None) => return Ok(()),
             Err(e) => return Err(e),
         };
+        let pdu_len = pdu.len();
 
         tunnel
             .handle_pdu(&pdu)
@@ -137,11 +146,17 @@ where
 
         while let Some(event) = tunnel.poll_event() {
             match event {
-                // `sub_headers` (e.g. auto-detect bandwidth measurement, MS-RDPBCGR
-                // 2.2.14) are not consumed here; this driver only wires the DVC
-                // payload through. A future auto-detect integration would need to
-                // dispatch them instead of discarding them.
-                TunnelEvent::Data { data, .. } => {
+                TunnelEvent::Data { sub_headers, data } => {
+                    let responses = autodetect.on_pdu(pdu_len, &sub_headers);
+                    if !responses.is_empty() {
+                        let reply = TunnelData {
+                            sub_headers: responses,
+                            higher_layer_data: Vec::new(),
+                        };
+                        // A closed write side is reported by the write pump itself;
+                        // the measurement reply is simply lost, like on any dead link.
+                        let _ = outgoing_tx.send(reply).await;
+                    }
                     if data_tx.send(data).await.is_err() {
                         // Application dropped the receiver
                         return Ok(());

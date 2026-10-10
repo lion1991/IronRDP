@@ -41,7 +41,7 @@ impl TunnelAutoDetect {
             if sub.sub_header_type != SubHeaderType::AutoDetectRequest {
                 continue;
             }
-            let request = match ironrdp_core::decode::<AutoDetectRequest>(&sub.data) {
+            let request = match decode_request(sub) {
                 Ok(request) => request,
                 Err(error) => {
                     debug!(%error, "Undecodable auto-detect request in tunnel sub-header, ignoring");
@@ -51,11 +51,8 @@ impl TunnelAutoDetect {
             let Some(response) = self.handle(request) else {
                 continue;
             };
-            match ironrdp_core::encode_vec(&response) {
-                Ok(data) => responses.push(TunnelSubHeader {
-                    sub_header_type: SubHeaderType::AutoDetectResponse,
-                    data,
-                }),
+            match encode_response(&response) {
+                Ok(sub) => responses.push(sub),
                 Err(error) => debug!(%error, "Failed to encode auto-detect response sub-header"),
             }
         }
@@ -105,6 +102,10 @@ impl TunnelAutoDetect {
                     byte_count,
                 })
             }
+            AutoDetectRequest::NetworkCharacteristicsResult { .. } => {
+                debug!(?request, "Received network characteristics over tunnel");
+                None
+            }
             other => {
                 debug!(request = ?other, "Unhandled auto-detect request in tunnel sub-header");
                 None
@@ -113,20 +114,53 @@ impl TunnelAutoDetect {
     }
 }
 
+/// SubHeaderLength / SubHeaderType double as the structure's headerLength /
+/// headerTypeId, so the request is the whole sub-header on the wire, not just
+/// its data.
+fn decode_request(sub: &TunnelSubHeader) -> Result<AutoDetectRequest, String> {
+    let wire = ironrdp_core::encode_vec(sub).map_err(|e| e.to_string())?;
+    ironrdp_core::decode(&wire).map_err(|e| e.to_string())
+}
+
+/// Inverse of [`decode_request`]: the response's first two bytes become the
+/// sub-header's own.
+fn encode_response(response: &AutoDetectResponse) -> Result<TunnelSubHeader, String> {
+    let wire = ironrdp_core::encode_vec(response).map_err(|e| e.to_string())?;
+    ironrdp_core::decode(&wire).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn request(request: AutoDetectRequest) -> TunnelSubHeader {
-        TunnelSubHeader {
-            sub_header_type: SubHeaderType::AutoDetectRequest,
-            data: ironrdp_core::encode_vec(&request).expect("encode request"),
-        }
+        let wire = ironrdp_core::encode_vec(&request).expect("encode request");
+        ironrdp_core::decode(&wire).expect("request is a valid sub-header")
     }
 
     fn decode_response(sub: &TunnelSubHeader) -> AutoDetectResponse {
         assert_eq!(sub.sub_header_type, SubHeaderType::AutoDetectResponse);
-        ironrdp_core::decode::<AutoDetectResponse>(&sub.data).expect("decode response")
+        let wire = ironrdp_core::encode_vec(sub).expect("encode sub-header");
+        ironrdp_core::decode(&wire).expect("decode response")
+    }
+
+    #[test]
+    fn sub_header_overlaps_the_auto_detect_header() {
+        let mut autodetect = TunnelAutoDetect::default();
+        // RTT Measure Request seq 9 as Windows sends it: SubHeaderData is only
+        // sequenceNumber + requestType.
+        let sub: TunnelSubHeader =
+            ironrdp_core::decode(&[0x06, 0x00, 0x09, 0x00, 0x01, 0x00]).expect("decode sub-header");
+        assert_eq!(sub.data.len(), 4);
+
+        let responses = autodetect.on_pdu(6, &[sub]);
+        let [response] = responses.as_slice() else {
+            panic!("expected one response sub-header, got {}", responses.len());
+        };
+        assert_eq!(
+            ironrdp_core::encode_vec(response).expect("encode response"),
+            [0x06, 0x01, 0x09, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]

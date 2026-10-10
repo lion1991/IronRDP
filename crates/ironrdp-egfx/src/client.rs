@@ -70,6 +70,8 @@ use tracing::{debug, trace, warn};
 use crate::CHANNEL_NAME;
 use crate::compositor::{Compositor, OutputUpdate};
 use crate::decode::H264Decoder;
+#[cfg(test)]
+use crate::decode::{DecodedRegion, crop_region};
 use crate::pdu::{
     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
@@ -1042,10 +1044,10 @@ impl GraphicsPipelineClient {
             return Ok(());
         };
 
-        let frame = decoder
-            .decode(stream.data)
+        let regions = decoder
+            .decode_regions(stream.data, &region_rects)
             .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
-        let (frame_w, frame_h) = (frame.width(), frame.height());
+        let (frame_w, frame_h) = (regions.frame_width, regions.frame_height);
 
         // Dimensions are right-left / bottom-top (exclusive RDPGFX_RECT16). A frame
         // smaller than the destination is only diagnostic: each region is clipped.
@@ -1071,22 +1073,19 @@ impl GraphicsPipelineClient {
 
         // One BitmapUpdate per regionRect (dest rect + tight RGBA), so consumers
         // accumulate a per-rect dirty region.
-        for rect in &region_rects {
-            let Some((data, x, y, w, h)) = extract_region_rgba(frame.data(), frame_w, frame_h, rect) else {
-                continue;
-            };
+        for region in regions.regions {
             let update = BitmapUpdate {
                 surface_id,
                 destination_rectangle: ExclusiveRectangle {
-                    left: x,
-                    top: y,
-                    right: x.saturating_add(w),
-                    bottom: y.saturating_add(h),
+                    left: region.left,
+                    top: region.top,
+                    right: region.left.saturating_add(region.width),
+                    bottom: region.top.saturating_add(region.height),
                 },
                 codec_id: Codec1Type::Avc420,
-                data,
-                width: w,
-                height: h,
+                data: region.data,
+                width: region.width,
+                height: region.height,
             };
             if self.builtin_compositing {
                 self.compositor
@@ -1498,52 +1497,6 @@ fn crop_decoded_frame(
     }
 
     cropped
-}
-
-/// Extract one AVC420 regionRect from a decoded RGBA frame into a tight RGBA buffer.
-///
-/// `rect` is in surface coordinates with **exclusive** right/bottom (RDPGFX_RECT16).
-/// Treating it as inclusive over-copies one row/column per rect, which for full-height
-/// rects comes from the 16-aligned frame's padding macroblocks (uninitialised YUV,
-/// 1px green edge lines). The region is clipped to the frame bounds. Returns
-/// `(data, x, y, w, h)`, or `None` for an empty / malformed / out-of-frame rect.
-#[expect(clippy::as_conversions, reason = "u32 widened to usize for indexing (lossless)")]
-fn extract_region_rgba(
-    frame: &[u8],
-    frame_w: u32,
-    frame_h: u32,
-    rect: &ExclusiveRectangle,
-) -> Option<(Vec<u8>, u16, u16, u16, u16)> {
-    if rect.right < rect.left || rect.bottom < rect.top {
-        return None;
-    }
-    // Frame dims are bounded by the surface size; saturate so the math stays in u16.
-    let fw = u16::try_from(frame_w).unwrap_or(u16::MAX);
-    let fh = u16::try_from(frame_h).unwrap_or(u16::MAX);
-    let (left, top) = (rect.left, rect.top);
-    let right = rect.right.min(fw);
-    let bottom = rect.bottom.min(fh);
-    if right <= left || bottom <= top {
-        return None;
-    }
-    let w = right - left;
-    let h = bottom - top;
-
-    let src_stride = frame_w as usize * 4;
-    let left_off = usize::from(left) * 4;
-    let dst_stride = usize::from(w) * 4;
-    let mut out = Vec::with_capacity(dst_stride * usize::from(h));
-    for row in top..bottom {
-        let so = usize::from(row) * src_stride + left_off;
-        let se = so + dst_stride;
-        if se <= frame.len() {
-            out.extend_from_slice(&frame[so..se]);
-        } else {
-            // Cannot happen once clipped to frame bounds; keep the buffer sized anyway.
-            out.resize(out.len() + dst_stride, 0);
-        }
-    }
-    Some((out, left, top, w, h))
 }
 
 /// Unit tests that require access to private fields (state, surfaces, frame tracking).
@@ -2057,7 +2010,13 @@ mod tests {
     fn extract_region_exclusive_bounds() {
         // 4x4 frame; region exclusive (1,1)-(3,3) -> origin (1,1) size 2x2.
         let frame = ramp_frame(4, 4);
-        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &excl(1, 1, 3, 3)).unwrap();
+        let DecodedRegion {
+            data,
+            left: x,
+            top: y,
+            width: w,
+            height: h,
+        } = crop_region(&frame, 4, 4, &excl(1, 1, 3, 3)).unwrap();
         assert_eq!((x, y, w, h), (1, 1, 2, 2));
         assert_eq!(data.len(), 2 * 2 * 4);
         assert_eq!(data[0], 5); // frame (1,1)
@@ -2068,7 +2027,13 @@ mod tests {
     #[test]
     fn extract_region_clips_to_frame_bounds() {
         let frame = ramp_frame(8, 8);
-        let (data, x, y, w, h) = extract_region_rgba(&frame, 8, 8, &excl(6, 6, 20, 20)).unwrap();
+        let DecodedRegion {
+            data,
+            left: x,
+            top: y,
+            width: w,
+            height: h,
+        } = crop_region(&frame, 8, 8, &excl(6, 6, 20, 20)).unwrap();
         assert_eq!((x, y), (6, 6));
         assert_eq!((w, h), (2, 2));
         assert_eq!(data.len(), 2 * 2 * 4);
@@ -2077,7 +2042,13 @@ mod tests {
     #[test]
     fn extract_region_full_frame() {
         let frame = ramp_frame(4, 4);
-        let (data, x, y, w, h) = extract_region_rgba(&frame, 4, 4, &excl(0, 0, 4, 4)).unwrap();
+        let DecodedRegion {
+            data,
+            left: x,
+            top: y,
+            width: w,
+            height: h,
+        } = crop_region(&frame, 4, 4, &excl(0, 0, 4, 4)).unwrap();
         assert_eq!((x, y, w, h), (0, 0, 4, 4));
         assert_eq!(data, frame);
     }
@@ -2085,14 +2056,14 @@ mod tests {
     #[test]
     fn extract_region_rejects_malformed() {
         let frame = ramp_frame(4, 4);
-        assert!(extract_region_rgba(&frame, 4, 4, &excl(3, 0, 1, 3)).is_none());
-        assert!(extract_region_rgba(&frame, 4, 4, &excl(0, 3, 3, 1)).is_none());
+        assert!(crop_region(&frame, 4, 4, &excl(3, 0, 1, 3)).is_none());
+        assert!(crop_region(&frame, 4, 4, &excl(0, 3, 3, 1)).is_none());
     }
 
     #[test]
     fn extract_region_out_of_frame_is_none() {
         let frame = ramp_frame(4, 4);
-        assert!(extract_region_rgba(&frame, 4, 4, &excl(4, 4, 5, 5)).is_none());
+        assert!(crop_region(&frame, 4, 4, &excl(4, 4, 5, 5)).is_none());
     }
 
     /// Surface height 4, decoded frame height 8 (1080 vs 1088): an exclusive bottom of 4
@@ -2104,7 +2075,12 @@ mod tests {
         for px in frame[4 * fw * 4..].chunks_exact_mut(4) {
             px.copy_from_slice(&[0xEE; 4]);
         }
-        let (data, _, _, w, h) = extract_region_rgba(&frame, 4, 8, &excl(0, 0, 4, 4)).unwrap();
+        let DecodedRegion {
+            data,
+            width: w,
+            height: h,
+            ..
+        } = crop_region(&frame, 4, 8, &excl(0, 0, 4, 4)).unwrap();
         assert_eq!((w, h), (4, 4));
         assert!(!data.contains(&0xEE), "padding rows must not leak into output");
     }

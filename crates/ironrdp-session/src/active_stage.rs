@@ -837,6 +837,13 @@ pub enum ActiveStageOutput {
     AutoReconnectCookie(ServerAutoReconnect),
     /// Server rejected the automatic reconnection attempt.
     AutoReconnectFailed,
+    /// Server Heartbeat PDU ([MS-RDPBCGR] 2.2.16.1). The client should treat
+    /// `period * (count1 + count2)` seconds without one as a dropped connection.
+    Heartbeat {
+        period: u8,
+        count1: u8,
+        count2: u8,
+    },
 }
 
 impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
@@ -863,6 +870,9 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
             x224::ProcessorOutput::AutoReconnectCookie(cookie) => Ok(Self::AutoReconnectCookie(cookie)),
             x224::ProcessorOutput::AutoReconnectFailed => Ok(Self::AutoReconnectFailed),
+            x224::ProcessorOutput::Heartbeat { period, count1, count2 } => {
+                Ok(Self::Heartbeat { period, count1, count2 })
+            }
             x224::ProcessorOutput::MonitorLayout(monitors) => Ok(Self::MonitorLayout(monitors)),
             // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
             // before reaching this conversion.

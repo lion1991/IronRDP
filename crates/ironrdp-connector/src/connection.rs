@@ -362,6 +362,11 @@ pub struct ClientConnector {
     ///
     /// Set via [`ClientConnector::with_auto_reconnect_cookie`].
     pub auto_reconnect_cookie: Option<ServerAutoReconnect>,
+    /// Network characteristics measured on the previous connection, when reconnecting.
+    ///
+    /// Set via [`ClientConnector::with_network_characteristics_sync`]; consumed by the
+    /// first connect-time request it answers.
+    pub network_characteristics_sync: Option<NetworkCharacteristicsSync>,
     /// Start of the in-flight connect-time bandwidth measurement window.
     ///
     /// Set when the server's Bandwidth Measure Start arrives, and only when the
@@ -389,6 +394,7 @@ impl ClientConnector {
             response_flags: nego::ResponseFlags::empty(),
             server_multitransport_flags: None,
             auto_reconnect_cookie: None,
+            network_characteristics_sync: None,
             connect_time_bw_started_at: None,
             connect_time_bw_bytes: 0,
         }
@@ -410,6 +416,18 @@ impl ClientConnector {
     #[must_use]
     pub fn with_auto_reconnect_cookie(mut self, cookie: ServerAutoReconnect) -> Self {
         self.auto_reconnect_cookie = Some(cookie);
+        self
+    }
+
+    /// Answer connect-time auto-detection with the previous connection's results.
+    ///
+    /// The first RTT Measure Request or connect-time Bandwidth Measure Start is
+    /// answered with a Network Characteristics Sync ([MS-RDPBCGR] 2.2.14.2.3), which
+    /// lets an auto-reconnecting client skip the measurement. Only meaningful together
+    /// with [`ClientConnector::with_auto_reconnect_cookie`].
+    #[must_use]
+    pub fn with_network_characteristics_sync(mut self, sync: NetworkCharacteristicsSync) -> Self {
+        self.network_characteristics_sync = Some(sync);
         self
     }
 
@@ -860,6 +878,26 @@ impl ClientConnector {
             BW_STOP_CONNECT_TIME,
         };
 
+        let sync_sequence = match request {
+            AutoDetectRequest::RttRequest { sequence_number, .. } => Some(sequence_number),
+            AutoDetectRequest::BandwidthMeasureStart {
+                sequence_number,
+                request_type,
+            } if request_type == BW_START_CONNECT_TIME => Some(sequence_number),
+            _ => None,
+        };
+        if let Some(sequence_number) = sync_sequence
+            && let Some(sync) = self.network_characteristics_sync.take()
+        {
+            let response = AutoDetectRspPdu::new(AutoDetectResponse::NetworkCharacteristicsSync {
+                sequence_number,
+                bandwidth_kbps: sync.bandwidth_kbps,
+                rtt_ms: sync.rtt_ms,
+            });
+            let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+            return Written::from_size(written);
+        }
+
         match request {
             AutoDetectRequest::RttRequest { sequence_number, .. } => {
                 let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
@@ -989,6 +1027,15 @@ impl ClientConnector {
             _ => Ok(Written::Nothing),
         }
     }
+}
+
+/// Previously measured network characteristics for [`ClientConnector::with_network_characteristics_sync`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkCharacteristicsSync {
+    /// Bandwidth in kilobits per second.
+    pub bandwidth_kbps: u32,
+    /// Round-trip time in milliseconds.
+    pub rtt_ms: u32,
 }
 
 /// Build an Initiate Multitransport Response carrying `hr_response`.
@@ -1710,6 +1757,7 @@ fn create_gcc_blocks<'a>(
                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
                         | ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT
+                        | ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU
                         | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU

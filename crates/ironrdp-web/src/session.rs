@@ -1105,6 +1105,7 @@ impl iron_remote_desktop::Session for Session {
                     ActiveStageOutput::AutoReconnectFailed => {
                         return Err(anyhow::Error::msg("automatic reconnect rejected by server").into());
                     }
+                    ActiveStageOutput::Heartbeat { .. } => {}
                     ActiveStageOutput::SaveSessionInfo { logon_complete: true } => {
                         debug!("RDP login complete");
                     }

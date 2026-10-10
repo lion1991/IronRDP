@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 
 use ironrdp_connector::MonotonicInstant;
-use ironrdp_connector::{ClientConnector, ClientConnectorState, Sequence as _, Written};
+use ironrdp_connector::{ClientConnector, ClientConnectorState, NetworkCharacteristicsSync, Sequence as _, Written};
 use ironrdp_core::{WriteBuf, encode_vec};
 use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
 use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
@@ -486,5 +486,79 @@ fn connect_time_bandwidth_second_start_discards_the_first_window() {
     assert_eq!(
         results.1, 1552,
         "the 4096 bytes counted before the second Start are discarded; only the second window's Payload and Stop, each with an 8-byte header, remain"
+    );
+}
+
+/// Decode the Auto-Detect Response carried by a response frame.
+fn decode_response(output: &WriteBuf) -> AutoDetectResponse {
+    let X224(McsMessage::SendDataRequest(send_data)) = ironrdp_core::decode(output.filled()).unwrap() else {
+        panic!("expected a SendDataRequest in the response frame");
+    };
+    ironrdp_core::decode::<AutoDetectRspPdu>(&send_data.user_data)
+        .unwrap()
+        .response
+}
+
+/// A reconnecting client answers the first connect-time request with the previous
+/// connection's results ([MS-RDPBCGR] 2.2.14.2.3), and only the first: later
+/// requests get ordinary replies.
+#[test]
+fn network_characteristics_sync_answers_the_first_request_only() {
+    let mut connector =
+        connect_time_autodetect_connector().with_network_characteristics_sync(NetworkCharacteristicsSync {
+            bandwidth_kbps: 5000,
+            rtt_ms: 68,
+        });
+
+    let rtt = |seq| {
+        server_send_data_indication(
+            MESSAGE_CHANNEL_ID,
+            encode_vec(&AutoDetectReqPdu::new(AutoDetectRequest::rtt_connect_time(seq))).unwrap(),
+        )
+    };
+
+    let mut output = WriteBuf::new();
+    connector.step(&rtt(0x10), None, &mut output).unwrap();
+    assert_eq!(
+        decode_response(&output),
+        AutoDetectResponse::NetworkCharacteristicsSync {
+            sequence_number: 0x10,
+            bandwidth_kbps: 5000,
+            rtt_ms: 68,
+        }
+    );
+
+    output.clear();
+    connector.step(&rtt(0x11), None, &mut output).unwrap();
+    assert_eq!(
+        decode_response(&output),
+        AutoDetectResponse::RttResponse { sequence_number: 0x11 }
+    );
+}
+
+/// A connect-time Bandwidth Measure Start is answered with the sync too, although an
+/// ordinary Start gets no reply.
+#[test]
+fn network_characteristics_sync_answers_a_connect_time_bandwidth_start() {
+    let mut connector =
+        connect_time_autodetect_connector().with_network_characteristics_sync(NetworkCharacteristicsSync {
+            bandwidth_kbps: 1200,
+            rtt_ms: 90,
+        });
+    let frame = server_send_data_indication(
+        MESSAGE_CHANNEL_ID,
+        encode_vec(&AutoDetectReqPdu::new(AutoDetectRequest::bw_start_connect_time(0x20))).unwrap(),
+    );
+
+    let mut output = WriteBuf::new();
+    connector.step(&frame, None, &mut output).unwrap();
+
+    assert_eq!(
+        decode_response(&output),
+        AutoDetectResponse::NetworkCharacteristicsSync {
+            sequence_number: 0x20,
+            bandwidth_kbps: 1200,
+            rtt_ms: 90,
+        }
     );
 }

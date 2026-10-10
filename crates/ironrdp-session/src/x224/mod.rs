@@ -81,6 +81,16 @@ pub enum ProcessorOutput {
     ///
     /// [\[MS-RDPBCGR\] 2.2.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dc672839-4f4e-40b1-a71c-cd6a959baa38
     AutoDetect(AutoDetectRequest),
+    /// Server Heartbeat PDU ([MS-RDPBCGR] 2.2.16.1), sent on the message channel when the
+    /// client advertises `RNS_UD_CS_SUPPORT_HEARTBEAT_PDU`.
+    Heartbeat {
+        /// Seconds between heartbeats.
+        period: u8,
+        /// Missed heartbeats before warning the user.
+        count1: u8,
+        /// Further missed heartbeats, after the warning, before reconnecting.
+        count2: u8,
+    },
     /// Slow-path graphics update ([MS-RDPBCGR] 2.2.9.1.1.3).
     /// Raw update payload starting with `updateType(u16)`.
     GraphicsUpdate(Vec<u8>),
@@ -520,7 +530,11 @@ impl Processor {
                 count2 = heartbeat.count2,
                 "Received Heartbeat PDU"
             );
-            return Ok(Vec::new());
+            return Ok(vec![ProcessorOutput::Heartbeat {
+                period: heartbeat.period,
+                count1: heartbeat.count1,
+                count2: heartbeat.count2,
+            }]);
         }
 
         if flags == BasicSecurityHeaderFlags::TRANSPORT_REQ {

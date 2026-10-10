@@ -52,16 +52,26 @@ fn encode_server_heartbeat(period: u8, count1: u8, count2: u8) -> Vec<u8> {
     encode_vec(&X224(indication)).unwrap()
 }
 
-/// A Heartbeat PDU is purely informational: [MS-RDPBCGR] 2.2.16.1 defines no
-/// client response, unlike Auto-Detect RTT requests on the same channel.
+/// [MS-RDPBCGR] 2.2.16.1 defines no client response, unlike Auto-Detect RTT
+/// requests on the same channel; the heartbeat is surfaced for liveness tracking.
 #[test]
-fn heartbeat_produces_no_response() {
+fn heartbeat_is_surfaced_without_a_response() {
     let mut processor = make_processor();
     let frame = encode_server_heartbeat(30, 4, 8);
 
     let outputs = process_frame(&mut processor, &frame);
 
-    assert!(outputs.is_empty(), "Heartbeat PDU must not produce any output");
+    assert!(
+        matches!(
+            outputs.as_slice(),
+            [ironrdp_session::x224::ProcessorOutput::Heartbeat {
+                period: 30,
+                count1: 4,
+                count2: 8
+            }]
+        ),
+        "Heartbeat PDU must surface its parameters and nothing else, got {outputs:?}"
+    );
 }
 
 /// The message channel demux must still route ordinary Auto-Detect traffic
@@ -72,7 +82,10 @@ fn autodetect_still_works_alongside_heartbeat() {
     let mut processor = make_processor();
 
     let heartbeat_frame = encode_server_heartbeat(30, 4, 8);
-    assert!(process_frame(&mut processor, &heartbeat_frame).is_empty());
+    assert!(matches!(
+        process_frame(&mut processor, &heartbeat_frame).as_slice(),
+        [ironrdp_session::x224::ProcessorOutput::Heartbeat { .. }]
+    ));
 
     let autodetect_pdu = AutoDetectReqPdu::new(AutoDetectRequest::rtt_continuous(7));
     let user_data = encode_vec(&autodetect_pdu).unwrap();

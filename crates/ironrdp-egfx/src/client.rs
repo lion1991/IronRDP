@@ -57,6 +57,8 @@ use std::collections::BTreeMap;
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use std::time::Instant;
+
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::progressive::{ProgressiveDecoder, TILE_BYTES_PER_PIXEL, TILE_DIM};
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
@@ -72,8 +74,8 @@ use crate::pdu::{
     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
     EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface2Pdu,
+    MapSurfaceToWindowPdu, PixelFormat, QoeFrameAcknowledgePdu, QueueDepth, RawCapabilitySet, SolidFillPdu,
+    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 
 /// Max capacity to keep for decompressed buffer when cleared.
@@ -434,6 +436,10 @@ pub struct GraphicsPipelineClient {
     frames_queued: u32,
     total_frames_decoded: u32,
     pending_output_reset: Option<(u16, u16)>,
+    /// Origin of the QoE `timestamp` field ([MS-RDPEGFX] 2.2.2.21).
+    epoch: Instant,
+    /// When the current frame's StartFrame was processed, for the QoE acknowledge.
+    frame_started_at: Option<Instant>,
 }
 
 impl GraphicsPipelineClient {
@@ -462,6 +468,8 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
             pending_output_reset: None,
+            epoch: Instant::now(),
+            frame_started_at: None,
         }
     }
 
@@ -566,6 +574,7 @@ impl GraphicsPipelineClient {
             }
             GfxPdu::StartFrame(start) => {
                 self.current_frame_id = Some(start.frame_id);
+                self.frame_started_at = Some(Instant::now());
                 self.frames_queued = self.frames_queued.saturating_add(1);
                 self.progressive_decoder.begin_frame();
                 trace!(frame_id = start.frame_id, "StartFrame");
@@ -747,6 +756,7 @@ impl GraphicsPipelineClient {
         // per spec, capabilities are negotiated via CapabilitiesConfirm before
         // ResetGraphics, and a ResetGraphics does not re-negotiate capabilities.
         self.current_frame_id = None;
+        self.frame_started_at = None;
         self.frames_queued = 0;
 
         // Reset decoder state for new stream
@@ -1199,6 +1209,7 @@ impl GraphicsPipelineClient {
 
     #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
     fn handle_end_frame(&mut self, frame_id: u32) -> PduResult<Vec<DvcMessage>> {
+        let end_frame_at = Instant::now();
         self.total_frames_decoded = self.total_frames_decoded.wrapping_add(1);
         self.current_frame_id = None;
         self.frames_queued = self.frames_queued.saturating_sub(1);
@@ -1222,8 +1233,43 @@ impl GraphicsPipelineClient {
         });
 
         trace!(frame_id, "Sending FrameAcknowledge");
-        Ok(vec![Box::new(ack) as DvcMessage])
+        let mut messages = vec![Box::new(ack) as DvcMessage];
+
+        // [2.2.2.21] QoE Frame Acknowledge: informational only, and MUST NOT be sent
+        // unless a V10+ capability set was confirmed. Rendering is whatever the
+        // handler did in `on_frame_complete`, so EDR ends when it returns.
+        if let Some(started_at) = self.frame_started_at.take()
+            && self.qoe_acknowledge_allowed()
+        {
+            let qoe = GfxPdu::QoeFrameAcknowledge(QoeFrameAcknowledgePdu {
+                frame_id,
+                timestamp: qoe_millis(started_at.saturating_duration_since(self.epoch)),
+                time_diff_se: qoe_time_diff(end_frame_at.saturating_duration_since(started_at)),
+                time_diff_dr: qoe_time_diff(end_frame_at.elapsed()),
+            });
+            trace!(frame_id, "Sending QoeFrameAcknowledge");
+            messages.push(Box::new(qoe) as DvcMessage);
+        }
+
+        Ok(messages)
     }
+
+    /// Whether the confirmed capability set is V10 or later ([MS-RDPEGFX] 2.2.2.21).
+    fn qoe_acknowledge_allowed(&self) -> bool {
+        self.negotiated_caps
+            .as_ref()
+            .is_some_and(|cap| !matches!(cap, CapabilitySet::V8 { .. } | CapabilitySet::V8_1 { .. }))
+    }
+}
+
+/// Wrapping millisecond timestamp for the QoE acknowledge; the server handles roll-over.
+fn qoe_millis(since_epoch: core::time::Duration) -> u32 {
+    u32::try_from(since_epoch.as_millis() & 0xFFFF_FFFF).unwrap_or(0)
+}
+
+/// 16-bit millisecond delta; the spec says SHOULD be 0 when it exceeds 65 seconds.
+fn qoe_time_diff(elapsed: core::time::Duration) -> u16 {
+    u16::try_from(elapsed.as_millis()).unwrap_or(0)
 }
 
 impl_as_any!(GraphicsPipelineClient);
@@ -1903,6 +1949,88 @@ mod tests {
         assert!(client.surfaces.is_empty(), "surfaces should be cleared");
         assert!(client.current_frame_id.is_none(), "frame_id should be reset");
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+    }
+
+    fn confirm_caps(client: &mut GraphicsPipelineClient, cap: CapabilitySet) {
+        let _ = client.handle_pdu(GfxPdu::CapabilitiesConfirm(
+            crate::pdu::CapabilitiesConfirmPdu::from_typed(&cap),
+        ));
+        assert!(client.is_active());
+    }
+
+    fn start_and_end_frame(client: &mut GraphicsPipelineClient, frame_id: u32) -> Vec<GfxPdu> {
+        let _ = client.handle_pdu(GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+            timestamp: crate::pdu::Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id,
+        }));
+        client
+            .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id }))
+            .expect("EndFrame")
+            .iter()
+            .map(|message| {
+                let bytes = ironrdp_core::encode_vec(message.as_ref()).expect("encode DVC message");
+                ironrdp_core::decode::<GfxPdu>(&bytes).expect("decode GfxPdu")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn end_frame_adds_qoe_acknowledge_only_with_v10_caps() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        confirm_caps(
+            &mut client,
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            },
+        );
+        let pdus = start_and_end_frame(&mut client, 5);
+        assert!(
+            matches!(pdus.as_slice(), [GfxPdu::FrameAcknowledge(ack)] if ack.frame_id == 5),
+            "V8: only the standard acknowledge, got {pdus:?}"
+        );
+
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        confirm_caps(
+            &mut client,
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+        );
+        let pdus = start_and_end_frame(&mut client, 6);
+        let [GfxPdu::FrameAcknowledge(ack), GfxPdu::QoeFrameAcknowledge(qoe)] = pdus.as_slice() else {
+            panic!("V10.7: standard acknowledge then QoE, got {pdus:?}");
+        };
+        assert_eq!(ack.frame_id, 6);
+        assert_eq!(qoe.frame_id, 6);
+        assert!(qoe.time_diff_se < 1000 && qoe.time_diff_dr < 1000);
+        assert!(client.frame_started_at.is_none(), "frame timing is consumed per frame");
+    }
+
+    #[test]
+    fn end_frame_without_start_frame_sends_no_qoe() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        confirm_caps(
+            &mut client,
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+        );
+        let pdus = client
+            .handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }))
+            .expect("EndFrame");
+        assert_eq!(pdus.len(), 1);
+    }
+
+    #[test]
+    fn qoe_time_diff_zeroes_out_of_range() {
+        assert_eq!(qoe_time_diff(core::time::Duration::from_millis(65535)), 65535);
+        assert_eq!(qoe_time_diff(core::time::Duration::from_millis(65536)), 0);
+        assert_eq!(qoe_millis(core::time::Duration::from_millis(0x1_0000_0005)), 5);
     }
 
     fn ramp_frame(w: u32, h: u32) -> Vec<u8> {
